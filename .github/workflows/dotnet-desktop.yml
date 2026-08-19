@@ -71,7 +71,7 @@ jobs:
     - name: Install .NET Core
       uses: actions/setup-dotnet@v3
       with:
-        dotnet-version: 6.0.x
+        dotnet-version: 8.0.x
 
     # Add  MSBuild to the PATH: https://github.com/microsoft/setup-msbuild
     - name: Setup MSBuild.exe
@@ -87,4 +87,4 @@ jobs:
       if: ${{ success() }}
       with:
         name: WeiboAlbumDownloader_Build
-        path: ./bin/Release/net6.0-windows/
+        path: ./bin/Release/net8.0-windows/
