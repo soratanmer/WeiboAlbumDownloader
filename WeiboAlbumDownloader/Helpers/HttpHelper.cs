@@ -74,15 +74,12 @@ namespace WeiboAlbumDownloader.Helpers
 
                 client = new HttpClient(handler);
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Add("Referer", "https://m.weibo.cn/");
-                if (string.IsNullOrEmpty(fileName))
-                {
-                    request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Safari/537.36");
-                    request.Headers.Add("Accept", "application/json, text/plain, */*");
-                    request.Headers.Add("Accept-Encoding", "gzip, deflate, br");
-                    request.Headers.Add("Accept-Language", "zh-CN,zh;q=0.9");
-                    request.Headers.Add("Cookie", cookie);
-                }
+                request.Headers.Add("Referer", url);
+                request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Safari/537.36");
+                request.Headers.Add("Accept", "application/json, text/plain, */*");
+                request.Headers.Add("Accept-Encoding", "gzip, deflate, br");
+                request.Headers.Add("Accept-Language", "zh-CN,zh;q=0.9");
+                request.Headers.Add("Cookie", cookie);
 
                 var response = await client.SendAsync(request);
 
