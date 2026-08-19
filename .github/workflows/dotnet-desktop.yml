@@ -80,6 +80,8 @@ jobs:
 
     # Execute all unit tests in the solution
     - name: Execute unit tests
+    - name: Build Release
+      run: dotnet build -c Release
       run: dotnet test
       
     # Upload bin directory
@@ -88,4 +90,4 @@ jobs:
       if: ${{ success() }}
       with:
         name: WeiboAlbumDownloader_Build
-        path: ./bin/Release/net10.0-windows/
+        path: ./WeiboAlbumDownloader/bin/Release/net10.0-windows/
