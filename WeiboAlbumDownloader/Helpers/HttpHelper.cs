@@ -103,9 +103,24 @@ namespace WeiboAlbumDownloader.Helpers
                 }
 
                 logAction?.Invoke($"[Response Status Code]: {response.StatusCode}", MessageEnum.Info);
-                //logAction?.Invoke($"[Response Body]: {responseBody}", MessageEnum.Info);
 
-                response.EnsureSuccessStatusCode();
+                if (!response.IsSuccessStatusCode)
+                {
+                    var snippet = string.Empty;
+                    if (!string.IsNullOrWhiteSpace(responseBody))
+                    {
+                        snippet = responseBody.Length <= 500 ? responseBody : responseBody.Substring(0, 500);
+                    }
+
+                    logAction?.Invoke($"[下载失败]: {url}", MessageEnum.Error);
+                    logAction?.Invoke($"[HTTP状态]: {response.StatusCode}", MessageEnum.Error);
+                    if (!string.IsNullOrWhiteSpace(snippet))
+                    {
+                        logAction?.Invoke($"[响应片段]: {snippet}", MessageEnum.Error);
+                    }
+
+                    throw new HttpRequestException($"请求失败，HTTP状态码: {response.StatusCode}");
+                }
 
                 if (!string.IsNullOrEmpty(fileName))
                 {
@@ -118,13 +133,11 @@ namespace WeiboAlbumDownloader.Helpers
                     string finalFullPath;
                     if (cleanedFileNameOnly.Length > 200)
                     {
-                        // Truncate the file name part, then recombine with the original directory
                         string truncatedFileName = cleanedFileNameOnly.Substring(0, 200) + Path.GetExtension(cleanedFileNameOnly);
                         finalFullPath = Path.Combine(directory, truncatedFileName);
                     }
                     else
                     {
-                        // Recombine the original directory with the cleaned file name
                         finalFullPath = Path.Combine(directory, cleanedFileNameOnly);
                     }
 
@@ -148,7 +161,7 @@ namespace WeiboAlbumDownloader.Helpers
             }
             catch (Exception ex)
             {
-                logAction?.Invoke($"[Request Failed]: URL: {url}", MessageEnum.Error);
+                logAction?.Invoke($"[Request Failed]: URL: {url}，原因: {ex.Message}", MessageEnum.Error);
                 if (responseBody != null && responseBody.Contains("<title>登录 - 微博</title>"))
                 {
                     logAction?.Invoke($"[Cookie可能失效]: {responseBody}", MessageEnum.Error);
