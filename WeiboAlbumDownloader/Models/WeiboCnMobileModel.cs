@@ -199,8 +199,7 @@ namespace WeiboAlbumDownloader.Models
         public PageInfo? PageInfo { get; set; }
 
         [JsonProperty("pics")]
-        //public List<Pic>? Pics { get; set; }
-        public object? Pics { get; set; }
+        public List<Pic>? Pics { get; set; }
 
         [JsonProperty("live_photo")]
         public List<string>? LivePhoto { get; set; }

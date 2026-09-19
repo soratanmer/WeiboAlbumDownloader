@@ -869,11 +869,6 @@ namespace WeiboAlbumDownloader
                                             {
                                                 originalLivePhotos.Add(item);
                                             }
-
-                                            //【诊断】临时日志：确认封面↔实况的权威关联字段（确认后删除）
-                                            AppendLog("【诊断】实况帖 pic_ids = " + JsonConvert.SerializeObject(card?.Mblog?.PicIds), MessageEnum.Warning);
-                                            AppendLog("【诊断】实况帖 live_photo = " + JsonConvert.SerializeObject(card?.Mblog?.LivePhoto), MessageEnum.Warning);
-                                            AppendLog("【诊断】实况帖 pics = " + SafeJson(card?.Mblog?.Pics), MessageEnum.Warning);
                                         }
                                         //选最高清晰度
                                         if (card?.Mblog?.PageInfo?.Urls?.Mp48kMp4 != null)
@@ -912,14 +907,32 @@ namespace WeiboAlbumDownloader
                                             + timestamp.ToString("yyyy-MM-dd HH_mm_ss") + newCaption;
                                         Debug.WriteLine(fileName);
 
+                                        //统一媒体队列：优先用 pics 的逐图权威结构（含实况 videoSrc），保证混合帖成对命名
+                                        var mediaItems = new List<(string JpgUrl, string? MovUrl)>();
+                                        bool usedPicsMedia = false;
+                                        if (card?.Mblog?.Pics is { Count: > 0 } picsList)
+                                        {
+                                            usedPicsMedia = true;
+                                            foreach (var pic in picsList)
+                                            {
+                                                if (string.IsNullOrEmpty(pic?.Pid)) continue;
+                                                mediaItems.Add(("https://wx4.sinaimg.cn/large/" + pic.Pid + ".jpg", ExtractLivePhotoMovUrl(pic.VideoSrc)));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            //回退：无 pics 数组（罕见），仅按 PicIds 下图，实况由原 LivePhoto 列表靠 CID 兜底
+                                            foreach (var pid in originalPics) mediaItems.Add((pid, null));
+                                        }
+
                                         int id = 1;
-                                        //下载获取图片列表中的图片原图
-                                        foreach (var item in originalPics)
+                                        //逐张下载图；实况图（有 videoSrc）成对下载同名 _k.mov 并自动合并
+                                        foreach (var item in mediaItems)
                                         {
                                             if (isSkip)
                                                 break;
 
-                                            if (string.IsNullOrEmpty(item))
+                                            if (string.IsNullOrEmpty(item.JpgUrl))
                                                 continue;
                                             var fileNamee = fileName + $"_{id}.jpg";
                                             //已存在的文件超过设置值，判定该用户下载过了
@@ -929,19 +942,20 @@ namespace WeiboAlbumDownloader
                                                 isSkip = true;
                                             }
 
-                                            //已经下载过的跳过
+                                            //已经下载过的跳过（该实况 id 也跳过，保证编号与图片位号对齐）
                                             if (File.Exists(fileNamee))
                                             {
                                                 AppendLog("文件已存在，跳过下载" + Path.GetFullPath(fileNamee), MessageEnum.Warning);
                                                 countDownloadedSkipToNextUser++;
                                                 await Task.Delay(500);
+                                                id++;
                                                 continue;
                                             }
 
-                                            //传入图片/视频的名字，开始下载图片/视频
+                                            //下载封面图
                                             try
                                             {
-                                                await HttpHelper.GetAsync<AlbumDetailModel>(item, dataSource, cookie!, fileNamee);
+                                                await HttpHelper.GetAsync<AlbumDetailModel>(item.JpgUrl, dataSource, cookie!, fileNamee);
 
                                                 //修改文件日期时间为发博的时间
                                                 SetFileTime(fileNamee, timestamp);
@@ -950,8 +964,45 @@ namespace WeiboAlbumDownloader
                                             }
                                             catch (Exception ex)
                                             {
-                                                AppendLog($"文件下载失败，原始url：{item}，下载路径{fileNamee}", MessageEnum.Error);
+                                                AppendLog($"文件下载失败，原始url：{item.JpgUrl}，下载路径{fileNamee}", MessageEnum.Error);
                                             }
+
+                                            //实况图：成对下载同名 _k.mov 并自动合并（CID优先，文件名兜底）
+                                            if (!string.IsNullOrEmpty(item.MovUrl))
+                                            {
+                                                var movFile = fileName + $"_{id}.mov";
+                                                if (File.Exists(movFile))
+                                                {
+                                                    AppendLog("文件已存在，跳过下载" + Path.GetFullPath(movFile), MessageEnum.Warning);
+                                                    countDownloadedSkipToNextUser++;
+                                                }
+                                                else
+                                                {
+                                                    try
+                                                    {
+                                                        await HttpHelper.GetAsync<AlbumDetailModel>(item.MovUrl, dataSource, cookie!, movFile);
+                                                        SetFileTime(movFile, timestamp);
+                                                        AppendLog("已完成 " + Path.GetFileName(movFile), MessageEnum.Success);
+
+                                                        try
+                                                        {
+                                                            if (MotionPhotoHelper.MergeByMov(movFile, out var mergeSkip))
+                                                                AppendLog("已自动合并为动态照片：" + Path.GetFileName(movFile), MessageEnum.Success);
+                                                            else
+                                                                AppendLog("实况照片未合并（" + mergeSkip + "）：" + Path.GetFileName(movFile), MessageEnum.Warning);
+                                                        }
+                                                        catch (Exception mergeEx)
+                                                        {
+                                                            AppendLog("自动合并实况照片失败，保留原始文件：" + mergeEx.Message, MessageEnum.Error);
+                                                        }
+                                                    }
+                                                    catch (Exception ex)
+                                                    {
+                                                        AppendLog($"文件下载失败，原始url：{item.MovUrl}，下载路径{movFile}", MessageEnum.Error);
+                                                    }
+                                                }
+                                            }
+
                                             id++;
                                         }
                                         if (settings!.EnableDownloadVideo)
@@ -997,7 +1048,8 @@ namespace WeiboAlbumDownloader
                                                 id++;
                                             }
                                         }
-                                        if (settings!.EnableDownloadLivePhoto)
+                                        //回退路径：仅当未用 pics 逐图结构时（无 pics 数组的罕见帖），才按 LivePhoto 列表下载，靠 CID 兜底
+                                        if (!usedPicsMedia && settings!.EnableDownloadLivePhoto)
                                         {
                                             foreach (var item in originalLivePhotos)
                                             {
@@ -1124,17 +1176,37 @@ namespace WeiboAlbumDownloader
             });
         }
 
-        /// <summary>【诊断】将对象序列化为 JSON，异常或超长时静默截断，避免刷屏</summary>
-        private static string SafeJson(object? obj)
+        /// <summary>
+        /// 从 pics 元素的 videoSrc 提取实况视频直链。
+        /// videoSrc 形如 "https://video.weibo.com/media/play?livephoto=<编码的.mov直链>"
+        /// </summary>
+        private static string? ExtractLivePhotoMovUrl(string? videoSrc)
         {
+            if (string.IsNullOrEmpty(videoSrc))
+            {
+                return null;
+            }
+
+            var idx = videoSrc.IndexOf("livephoto=", StringComparison.Ordinal);
+            if (idx < 0)
+            {
+                return null;
+            }
+
+            var raw = videoSrc.Substring(idx + "livephoto=".Length);
+            var amp = raw.IndexOf('&');
+            if (amp >= 0)
+            {
+                raw = raw.Substring(0, amp);
+            }
+
             try
             {
-                var json = JsonConvert.SerializeObject(obj);
-                return json != null && json.Length > 3000 ? json.Substring(0, 3000) + "…(截断)" : json ?? "null";
+                return Uri.UnescapeDataString(raw);
             }
-            catch (Exception ex)
+            catch
             {
-                return "序列化失败:" + ex.Message;
+                return null;
             }
         }
 

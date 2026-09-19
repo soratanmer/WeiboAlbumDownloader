@@ -214,6 +214,15 @@ namespace WeiboAlbumDownloader.Helpers
                 }
             }
 
+            // 文件名兜底：同目录中与 mov 基础卷名(去掉扩展名)完全一致的 jpg 视为配对
+            var movName = Path.GetFileNameWithoutExtension(mov);
+            var byName = availableJpgs.FirstOrDefault(j =>
+                string.Equals(Path.GetFileNameWithoutExtension(j), movName, StringComparison.OrdinalIgnoreCase));
+            if (byName is not null)
+            {
+                return byName;
+            }
+
             // 唯一性兜底：组内只剩 1 张未被消费的 jpg 且仅有 1 个 mov，则唯一配对
             if (availableJpgs.Count == 1)
             {
@@ -746,6 +755,17 @@ namespace WeiboAlbumDownloader.Helpers
                     matchedJpg = jpg;
                     break;
                 }
+            }
+
+            if (string.IsNullOrEmpty(matchedJpg))
+            {
+                // CID 未能配对（如 cover 被 sinaimg 无损重编码后丢失 EXIF）→ 文件名兜底：
+                // 找同级目录中基础卷名(去掉扩展名)与 mov 完全一致的 jpg
+                var movName = Path.GetFileNameWithoutExtension(movPath);
+                matchedJpg = Directory.EnumerateFiles(dir)
+                    .Where(f => IsJpg(f))
+                    .FirstOrDefault(j => string.Equals(
+                        Path.GetFileNameWithoutExtension(j), movName, StringComparison.OrdinalIgnoreCase));
             }
 
             if (string.IsNullOrEmpty(matchedJpg))
