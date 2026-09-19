@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -694,7 +695,70 @@ namespace WeiboAlbumDownloader.Helpers
             }
         }
 
+        /// <summary>
+        /// 下载完成后自动合并单个实况照片：读取 mov 的 ContentIdentifier，
+        /// 在同级目录定位配对封面 jpg，再复用 MergeOne 覆盖封面并删除 mov。
+        /// </summary>
+        /// <param name="movPath">刚下载的实况视频路径(.mov)</param>
+        /// <param name="skipReason">返回跳过原因（未跳过时为 null）</param>
+        /// <returns>是否完成合并（true）或跳过（false）。定位或合并失败以异常抛出</returns>
+        public static bool MergeByMov(string movPath, out string? skipReason)
+        {
+            skipReason = null;
+
+            if (string.IsNullOrWhiteSpace(movPath) || !File.Exists(movPath))
+            {
+                throw new FileNotFoundException("实况视频不存在。", movPath);
+            }
+
+            // ① 读取 mov 的 ContentIdentifier 作精确配对信号
+            var movCid = ReadContentIdentifier(movPath, ContentIdentifierKind.Video);
+            if (string.IsNullOrEmpty(movCid))
+            {
+                skipReason = "无法读取实况视频 ContentIdentifier";
+                return false;
+            }
+
+            // ② 在同级目录(非递归)按相同 UUID 定位配对封面 jpg
+            var dir = Path.GetDirectoryName(movPath) ?? throw new InvalidDataException("无法解析实况视频目录。");
+            string? matchedJpg = null;
+            foreach (var jpg in Directory.EnumerateFiles(dir).Where(f => IsJpg(f)))
+            {
+                if (string.Equals(ReadContentIdentifier(jpg, ContentIdentifierKind.Photo), movCid, StringComparison.Ordinal))
+                {
+                    matchedJpg = jpg;
+                    break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(matchedJpg))
+            {
+                skipReason = "未找到配对封面 jpg";
+                return false;
+            }
+
+            // ③ 复用 MergeOne：内部含幂等、成功后覆盖+删除
+            var tempDir = Path.Combine(Path.GetTempPath(), "WeiboAlbumDownloader", $"motion-by-mov-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            try
+            {
+                return MergeOne(new LivePhotoPair { JpgPath = matchedJpg, MovPath = movPath, GroupKey = string.Empty }, tempDir, out skipReason);
+            }
+            finally
+            {
+                TryDeleteDirectory(tempDir);
+            }
+        }
+
         // ─────────────────────────── 工具方法 ───────────────────────────
+
+        /// <summary>判断是否为 jpg/jpeg 文件</summary>
+        private static bool IsJpg(string path)
+        {
+            var ext = Path.GetExtension(path);
+            return string.Equals(ext, ".jpg", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".jpeg", StringComparison.OrdinalIgnoreCase);
+        }
 
         /// <summary>尽力删除文件，异常静默</summary>
         private static void TryDeleteFile(string? path)

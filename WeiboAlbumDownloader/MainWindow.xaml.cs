@@ -1027,6 +1027,19 @@ namespace WeiboAlbumDownloader
                                                     SetFileTime(fileNamee, timestamp);
 
                                                     AppendLog("已完成 " + Path.GetFileName(fileNamee), MessageEnum.Success);
+
+                                                    //下载完成后自动合成为动态照片（覆盖封面、删除 mov）；失败仅记录，不中断下载
+                                                    try
+                                                    {
+                                                        if (MotionPhotoHelper.MergeByMov(fileNamee, out var mergeSkip))
+                                                            AppendLog("已自动合并为动态照片：" + Path.GetFileName(fileNamee), MessageEnum.Success);
+                                                        else
+                                                            AppendLog("实况照片未合并（" + mergeSkip + "）：" + Path.GetFileName(fileNamee), MessageEnum.Warning);
+                                                    }
+                                                    catch (Exception mergeEx)
+                                                    {
+                                                        AppendLog("自动合并实况照片失败，保留原始文件：" + mergeEx.Message, MessageEnum.Error);
+                                                    }
                                                 }
                                                 catch (Exception ex)
                                                 {
