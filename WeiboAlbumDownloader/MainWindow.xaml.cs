@@ -869,6 +869,11 @@ namespace WeiboAlbumDownloader
                                             {
                                                 originalLivePhotos.Add(item);
                                             }
+
+                                            //【诊断】临时日志：确认封面↔实况的权威关联字段（确认后删除）
+                                            AppendLog("【诊断】实况帖 pic_ids = " + JsonConvert.SerializeObject(card?.Mblog?.PicIds), MessageEnum.Warning);
+                                            AppendLog("【诊断】实况帖 live_photo = " + JsonConvert.SerializeObject(card?.Mblog?.LivePhoto), MessageEnum.Warning);
+                                            AppendLog("【诊断】实况帖 pics = " + SafeJson(card?.Mblog?.Pics), MessageEnum.Warning);
                                         }
                                         //选最高清晰度
                                         if (card?.Mblog?.PageInfo?.Urls?.Mp48kMp4 != null)
@@ -1117,6 +1122,20 @@ namespace WeiboAlbumDownloader
                     MessageType = messageEnum
                 });
             });
+        }
+
+        /// <summary>【诊断】将对象序列化为 JSON，异常或超长时静默截断，避免刷屏</summary>
+        private static string SafeJson(object? obj)
+        {
+            try
+            {
+                var json = JsonConvert.SerializeObject(obj);
+                return json != null && json.Length > 3000 ? json.Substring(0, 3000) + "…(截断)" : json ?? "null";
+            }
+            catch (Exception ex)
+            {
+                return "序列化失败:" + ex.Message;
+            }
         }
 
         private void AddToUserIdList(string userId, string nickName)
