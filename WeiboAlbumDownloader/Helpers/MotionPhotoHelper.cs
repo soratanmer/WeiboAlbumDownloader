@@ -88,8 +88,11 @@ namespace WeiboAlbumDownloader.Helpers
         /// <summary>流式复制缓冲大小（1MB）</summary>
         private const int CopyBufferSize = 1024 * 1024;
 
-        /// <summary>ContentIdentifier 读取时对视频的扫描上限字节数（moov 通常位于文件前部）</summary>
-        private const long VideoScanLimitBytes = 8 * 1024 * 1024;
+        /// <summary>ContentIdentifier 读取时的分块扫描块大小</summary>
+        private const int ScanChunkBytes = 1024 * 1024;
+
+        /// <summary>跨块保留的尾部字符数，确保跨块边界上的 UUID 不被遗漏（UUID 36 字符，留余量）</summary>
+        private const int UuidCarryChars = 40;
 
         /// <summary>动态照片探测时读取的头部字节上限</summary>
         private const int DetectionScanBytes = 128 * 1024;
@@ -241,7 +244,7 @@ namespace WeiboAlbumDownloader.Helpers
         /// <param name="filePath">文件路径</param>
         /// <param name="kind">媒体端类型，决定扫描上限</param>
         /// <returns>UUID 字符串（大写）；未找到返回 null</returns>
-        public static string? ReadContentIdentifier(string filePath, ContentIdentifierKind kind)
+        public static string? ReadContentIdentifier(string filePath, ContentIdentifierKind _)
         {
             try
             {
@@ -250,35 +253,49 @@ namespace WeiboAlbumDownloader.Helpers
                     return null;
                 }
 
-                var length = new FileInfo(filePath).Length;
-                long readLimit = kind == ContentIdentifierKind.Video
-                    ? Math.Min(length, VideoScanLimitBytes)
-                    : length;
-
-                var buffer = new byte[readLimit];
-                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                {
-                    var read = fs.Read(buffer, 0, buffer.Length);
-                    if (read <= 0)
-                    {
-                        return null;
-                    }
-                }
-
-                var text = Encoding.ASCII.GetString(buffer).Replace("\0", string.Empty);
-                var match = UuidRegex.Match(text);
-                if (!match.Success)
-                {
-                    return null;
-                }
-
-                return match.Value.ToUpperInvariant();
+                var uuid = FindUuidInFile(filePath);
+                return string.IsNullOrEmpty(uuid) ? null : uuid.ToUpperInvariant();
             }
             catch
             {
                 // 元数据读取失败不作为阻断，交由调用方按唯一性兜底
                 return null;
             }
+        }
+
+        /// <summary>
+        /// 分块流式扫描整个文件的 ASCII 内容，定位 UUID。
+        /// 不再对视频设置前 8MB 上限——微博高清实况视频的 ContentIdentifier 可能位于文件后部。
+        /// 内存按块占用，避免一次性装载大文件。
+        /// </summary>
+        private static string? FindUuidInFile(string filePath)
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var buffer = new byte[ScanChunkBytes];
+            string carry = string.Empty;
+
+            while (true)
+            {
+                var read = fs.Read(buffer, 0, buffer.Length);
+                if (read <= 0)
+                {
+                    break;
+                }
+
+                var combined = carry + Encoding.ASCII.GetString(buffer, 0, read);
+                var match = UuidRegex.Match(combined);
+                if (match.Success)
+                {
+                    return match.Value;
+                }
+
+                // 保留尾部若干字符，使跨块边界的 UUID 得以被下一次命中
+                carry = combined.Length > UuidCarryChars
+                    ? combined.Substring(combined.Length - UuidCarryChars)
+                    : combined;
+            }
+
+            return null;
         }
 
         // ─────────────────────────── ③ Google GCamera XMP 构建 ───────────────────────────
