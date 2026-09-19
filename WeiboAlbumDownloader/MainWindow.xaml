@@ -167,6 +167,21 @@
               Visibility="Collapsed" />
           </StackPanel>
         </mica:Button>
+        <mica:Button
+          Width="120"
+          Height="32"
+          Margin="8,0,0,0"
+          Click="MergeMotionPhotos_Click"
+          CornerRadius="0 2 2 0"
+          FontSize="11"
+          ToolTip="扫描下载目录中的实况照片，合并为 Google 动态照片（覆盖原图并删除配对视频）">
+          <StackPanel Orientation="Horizontal">
+            <TextBlock
+              Margin="8,0,0,0"
+              VerticalAlignment="Center"
+              Text="合并动态照片" />
+          </StackPanel>
+        </mica:Button>
       </StackPanel>
       <mica:Button
         Grid.Column="4"

@@ -1253,6 +1253,56 @@ namespace WeiboAlbumDownloader
             isDownloading = false;
         }
 
+        /// <summary>
+        /// 批量合并动态照片入口：扫描下载目录 → 逐对合并 → 覆盖原图并删除配对视频
+        /// </summary>
+        private async void MergeMotionPhotos_Click(object sender, RoutedEventArgs e)
+        {
+            if (!Directory.Exists(downloadFolder))
+            {
+                AppendLog("下载目录不存在，请先下载微博内容。", MessageEnum.Error);
+                return;
+            }
+
+            var dialogResult = MessageBox.Show(
+                "将扫描下载目录中的实况照片并合并为 Google 动态照片。\r\n\r\n" +
+                "注意：合并成功后，会【覆盖原始照片】并【删除配对视频(.mov)】。是否继续？",
+                "合并动态照片",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (dialogResult != MessageBoxResult.OK)
+            {
+                return;
+            }
+
+            var btn = sender as MicaWPF.Controls.Button;
+            if (btn != null)
+            {
+                btn.IsEnabled = false;
+            }
+
+            try
+            {
+                await Task.Run(() =>
+                {
+                    MotionPhotoHelper.MergeAll(downloadFolder, msg => AppendLog(msg, MessageEnum.Info));
+                });
+
+                AppendLog("合并动态照片完成。", MessageEnum.Success);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"合并动态照片失败：{ex.Message}", MessageEnum.Error);
+            }
+            finally
+            {
+                if (btn != null)
+                {
+                    btn.IsEnabled = true;
+                }
+            }
+        }
+
         private void ListView_CopyLog(object sender, RoutedEventArgs e)
         {
             if (ListView_Messages.SelectedItem != null)

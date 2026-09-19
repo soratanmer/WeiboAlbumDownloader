@@ -366,3 +366,6 @@ FodyWeavers.xsd
 
 /WeiboAlbumDownloader/DownLoad
 Settings.json
+/docs
+/photos
+/temp_tests
