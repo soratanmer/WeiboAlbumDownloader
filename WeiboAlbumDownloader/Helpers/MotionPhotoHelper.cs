@@ -63,16 +63,18 @@ namespace WeiboAlbumDownloader.Helpers
     }
 
     /// <summary>
-    /// 实况照片批量合并为 Google MotionPhoto（纯 C# 自实现，无任何外部工具依赖）
+    /// 实况照片批量合并为 Google MotionPhoto。
+    /// 视频容器（MOV→MP4）交由 FFmpeg remux 重建，容器正确性不再靠手工字节手术。
     /// </summary>
     /// <remarks>
     /// 目标格式：<br/>
     /// 1. 物理结构 = 标准 JPEG 封面（前段）+ 尾部二进制拼接的 MP4 微视频；<br/>
     /// 2. 在 JPEG 头部注入 Google GCamera XMP 容器描述（MicroVideoOffset = 内嵌 MP4 的起始偏移，
-///    Item:Length = 内嵌视频字节长度）；<br/>
+    ///    Item:Length = 内嵌视频字节长度）；<br/>
     /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
-    /// 因微博下载的实况视频均为 H.264(avc1)+AAC(mp4a)，MOV 与 MP4 共享 ISOBMFF 盒结构，
-    /// 故可仅改写 ftyp 品牌字节即可安全换标为 MP4 容器，无需重新编码。
+    /// 内嵌 MP4 由 <see cref="FfmpegInvoker.RemuxToMp4"/> 用 FFmpeg 重封装：moov 前置(+faststart)、
+    /// 音频重编码为标准 AAC、剔除 iPhone 专有扩展盒(mebx/edts/tapt/ctts等)并重建时序表，
+    /// 产出主流播放器（Windows Photos / 小米相册）均可解析的合规容器。FFmpeg 缺失时退化为仅换标。
     /// </remarks>
     public static class MotionPhotoHelper
     {
@@ -416,386 +418,31 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ⑤ MOV → MP4 换标 ───────────────────────────
 
         /// <summary>
-        /// 将 QuickTime MOV 改写为标准 MP4 容器：换 ftyp 品牌，并剥离 iPhone 实况携带的
-        ///「mebx」元数据轨道（内容不变，仅剔除非标准轨道）
+        /// 将 QuickTime MOV 改写为标准 MP4 容器。
+        /// 优先用 FFmpeg remux 重建（moov 前置 +faststart、音频重编码 AAC、剔除 iPhone 专有扩展盒并重建时序表），
+        /// 产出 Windows Photos / 小米相册均可解析的合规容器；FFmpeg 缺失或失败时退化为仅换 ftyp 品牌字节，
+        /// 至少可被完整播放器识别。
         /// </summary>
-        /// <remarks>
-        /// MOV 与 MP4 共享 ISOBMFF 盒结构，微博下载的 iPhone 实况视频均为 H.264+AAC：
-        /// ① 把 major brand 由 qt 改为 isom、compatible 中出现 qt 的改为 mp42，符合 MP4 品牌标识；
-        /// ② 原生 iPhone 实况还携带一条 QuickTime「mebx」时控元数据轨道。小米等浅解析播放器
-        ///    的 MediaExtractor 不识别该媒体类型，会导致「点播放无反应」；而飞牛等完整播放器会
-        ///    跳过它所以能播。故剥离该轨道，还原成标准的「avc1 视频 + mp4a 音频」两轨 MP4。
-        /// 兼容两种布局：moov 位于文件尾部时，剔除轨道仅截短尾部，mdat 与全部 sample 偏移不变；
-        /// moov 位于 mdat 之前时，剔除会让 mdat 整段左移 Δ，故统一回写 stco/co64 绝对偏移（Δ 平移），
-        /// 并回写新的 moov size。无论何种情形，视频/音频 sample 字节逐位不变、总长度仅减少被剔除的
-        /// 轨道字节。未找到 ftyp 时视为已合规，直接复制。
-        /// </remarks>
         /// <param name="movPath">源 MOV 路径</param>
         /// <param name="outPath">输出 MP4 路径（通常为临时文件）</param>
         /// <returns>输出文件完整路径</returns>
         public static string RelabelMovToMp4(string movPath, string outPath)
         {
-            // 读取整个视频到内存以便换标与剔除 mebx 轨道。实况视频为短视频（通常 ≤ 数十 MB），
-            // 内存占用可接受；单次合并仅处理一个视频。
-            var bytes = File.ReadAllBytes(movPath);
-
-            // ① 修正 ftyp 品牌字节（仅首个盒子头部，内容不变）
-            var patchLen = Math.Min(bytes.Length, 64);
-            var patched = PatchFtypBrand(bytes, patchLen);
-            Buffer.BlockCopy(patched, 0, bytes, 0, patchLen);
-
-            // ② 剥离 iPhone「mebx」元数据轨道，并把 moov 彻底重排为「ftyp,mdat,moov」标准 ISO BMFF 布局：
-            //    剔除 mebx 轨道导致的偏移已由 StripMebxMetadataTrack 处理，再剔除 iPhone 专有盒(edts/tapt/
-            //    ctts/cslg/sdtp/sgpd/sbgp)并统一修正 stco/co64。任一步失败都回退为仅换标，不阻塞合并。
             try
             {
-                bytes = StripMebxMetadataTrack(bytes);
-                bytes = StandardizeMoovToIso(bytes);
+                FfmpegInvoker.RemuxToMp4(movPath, outPath);
+                return outPath;
             }
             catch
             {
-                // 标准化失败不阻塞合并：仍输出已换标、可被完整播放器识别的 MP4
+                // FFmpeg 缺失或失败：退化为仅换标（不改字节结构），不做脆弱的 moov 手术，
+                // 避免产出结构自洽性更差的半成品。
+                var bytes = File.ReadAllBytes(movPath);
+                var header = PatchFtypBrand(bytes, Math.Min(bytes.Length, 64));
+                Buffer.BlockCopy(header, 0, bytes, 0, header.Length);
+                File.WriteAllBytes(outPath, bytes);
+                return outPath;
             }
-
-            File.WriteAllBytes(outPath, bytes);
-            return outPath;
-        }
-
-        /// <summary>
-        /// 剥离 moov 中的 QuickTime「mebx」元数据轨道，视频/音频 sample 字节不受影响。
-        /// 适用两种布局：moov 位于文件尾时，剔除该轨道只让 moov 缩小、mdat 不动、偏移原样有效；
-        /// moov 位于 mdat 之前时，剔除会让 moov 及后续 mdat 整体左移 Δ，故需对 stco/co64 全部
-        /// sample 绝对偏移做统一修正。两种情形均回写新的 moov size 字段。无 mebx 轨道时原样返回。
-        /// </summary>
-        private static byte[] StripMebxMetadataTrack(byte[] data)
-        {
-            // ① 解析顶层盒子，定位 moov 与首个 mdat
-            long moovStart = -1, moovSize = 0, mdatStart = -1;
-            var moovExt = false;
-            var i = 0L;
-            while (i + 8 <= data.Length)
-            {
-                var s32 = ReadUInt32BE(data, i);
-                var type = Encoding.Latin1.GetString(data, (int)i + 4, 4);
-                long size;
-                var ext = false;
-                if (s32 == 1) { size = (long)ReadUInt64BE(data, i + 8); ext = true; }
-                else if (s32 == 0) size = data.Length - i;
-                else size = s32;
-                if (size < 8 || i + size > data.Length) break;
-                if (type == "moov") { moovStart = i; moovSize = size; moovExt = ext; }
-                else if (type == "mdat" && mdatStart < 0) mdatStart = i;
-                i += size;
-            }
-            if (moovStart < 0 || mdatStart < 0) return data;
-
-            var moovEnd = moovStart + moovSize;
-            var childHdr = moovExt ? 16 : 8;
-            var oldDataStart = mdatStart + 8; // 首个 mdat 的数据区起点
-
-            // ② 遍历 moov 子盒，收集全部 mebx 元数据轨道（iPhone 实况可能含多条），按起始升序
-            var mebxTracks = new List<(long Start, long Size)>();
-            var ci = moovStart + childHdr;
-            while (ci + 8 < moovEnd)
-            {
-                var cs = ReadUInt32BE(data, ci);
-                var ct = Encoding.Latin1.GetString(data, (int)ci + 4, 4);
-                if (cs < 8 || ci + cs > moovEnd) break;
-                if (ct == "trak" && IsMebxTrack(data, ci + 8, ci + cs)) mebxTracks.Add((ci, cs));
-                ci += cs;
-            }
-            if (mebxTracks.Count == 0) return data;
-            mebxTracks.Sort((a, b) => a.Start.CompareTo(b.Start));
-
-            // ③ 计算并回写新的 moov size（减去全部 mebx 轨道长度）
-            var removedTotal = 0L;
-            foreach (var (_, sz) in mebxTracks) removedTotal += sz;
-            var newMoovSize = moovSize - removedTotal;
-            if (moovExt) WriteUInt64BE(data, moovStart + 8, (ulong)newMoovSize);
-            else WriteUInt32BE(data, moovStart, (uint)newMoovSize);
-
-            // ④ 原位拼接：剔除全部 mebx 轨道段（按升序跳过）
-            var outBuf = new byte[data.Length - removedTotal];
-            var srcPos = 0L;
-            var dstPos = 0L;
-            foreach (var (ms, msz) in mebxTracks)
-            {
-                Buffer.BlockCopy(data, (int)srcPos, outBuf, (int)dstPos, (int)(ms - srcPos));
-                dstPos += ms - srcPos;
-                srcPos = ms + msz;
-            }
-            Buffer.BlockCopy(data, (int)srcPos, outBuf, (int)dstPos, (int)(data.Length - srcPos));
-
-            // ⑤ 计算 mdat 数据区平移量并回填 stco/co64 偏移（moov 前置时 mdat 左移为负 Δ）
-            var newMdatStart = FindFirstMdatStart(outBuf);
-            if (newMdatStart >= 0)
-            {
-                var delta = (newMdatStart + 8) - oldDataStart;
-                if (delta != 0) PatchChunkOffsets(outBuf, moovStart + childHdr, moovStart + newMoovSize, delta);
-            }
-            return outBuf;
-        }
-
-        /// <summary>
-        /// 在字节数组中查找首个顶层 mdat 盒子的起始偏移；找不到返回 -1
-        /// </summary>
-        private static long FindFirstMdatStart(byte[] data)
-        {
-            var i = 0L;
-            while (i + 8 <= data.Length)
-            {
-                var s32 = ReadUInt32BE(data, i);
-                var type = Encoding.Latin1.GetString(data, (int)i + 4, 4);
-                long size;
-                if (s32 == 1) size = (long)ReadUInt64BE(data, i + 8);
-                else if (s32 == 0) size = data.Length - i;
-                else size = s32;
-                if (size < 8 || i + size > data.Length) break;
-                if (type == "mdat") return i;
-                i += size;
-            }
-            return -1;
-        }
-
-        /// <summary>
-        /// 递归扫描 moov 子盒内的 stco/co64 表，把每个 sample 绝对偏移增加 Δ（可为负）
-        /// </summary>
-        private static void PatchChunkOffsets(byte[] data, long start, long end, long delta)
-        {
-            var stack = new Stack<(long S, long E)>();
-            stack.Push((start, end));
-            while (stack.Count > 0)
-            {
-                var (s, e) = stack.Pop();
-                var idx = s;
-                while (idx + 8 <= e)
-                {
-                    var size32 = ReadUInt32BE(data, idx);
-                    var type = Encoding.Latin1.GetString(data, (int)idx + 4, 4);
-                    long size;
-                    long hdr;
-                    if (size32 == 1) { size = (long)ReadUInt64BE(data, idx + 8); hdr = 16; }
-                    else if (size32 == 0) { size = e - idx; hdr = 8; }
-                    else { size = size32; hdr = 8; }
-                    if (size < hdr || idx + size > e) break;
-
-                    if (type is "stco" or "co64") PatchOneOffsetTable(data, idx, hdr, type, delta);
-                    else if (type is "trak" or "mdia" or "minf" or "stbl" or "moov") stack.Push((idx + hdr, idx + size));
-                    idx += size;
-                }
-            }
-        }
-
-        /// <summary>
-        /// 修正单个 stco(32位) / co64(64位) 偏移表的所有条目（delta 可为负）
-        /// </summary>
-        private static void PatchOneOffsetTable(byte[] data, long start, long hdr, string type, long delta)
-        {
-            var count = ReadUInt32BE(data, start + hdr + 4);
-            var entryBase = start + hdr + 8;
-            if (type == "stco")
-            {
-                for (ulong e = 0; e < count; e++)
-                {
-                    var off = ReadUInt32BE(data, entryBase + (long)e * 4);
-                    WriteUInt32BE(data, entryBase + (long)e * 4, (uint)((long)off + delta));
-                }
-            }
-            else // co64 为 64 位偏移
-            {
-                for (ulong e = 0; e < count; e++)
-                {
-                    var off = ReadUInt64BE(data, entryBase + (long)e * 8);
-                    WriteUInt64BE(data, entryBase + (long)e * 8, (ulong)((long)off + delta));
-                }
-            }
-        }
-
-        /// <summary>
-        /// 把 moov 彻底重排为标准 ISO BMFF 布局「ftyp,mdat,moov」（对齐可被小米完整识别的 QQ 参考文件），
-        /// 并剔除 iPhone QuickTime 专有扩展盒：trak 层剔除 edts/tapt，stbl 层剔除 ctts/cslg/sdtp/sgpd/sbgp，
-        /// 顶层 wide/free 因不复制而自然消失。所有媒体 sample 数据(mdat payload)逐字保留、零转码。
-        /// <para>
-        /// 入参 <paramref name="data"/> 为纯 MP4 字节数组（ftyp 位于偏移 0），故 stco/co64 的"绝对文件偏移"
-        /// 即"相对 ftyp 的偏移"。重排后 mdat 数据区由 oldDataStart 平移到 newDataStart，对全部 sample 偏移
-        /// 统一加 Δ = newDataStart − oldDataStart 即可，样本自身字节不动。
-        /// </para>
-        /// </summary>
-        private static byte[] StandardizeMoovToIso(byte[] data)
-        {
-            // ① 解析顶层盒子，定位 ftyp、mdat、moov
-            long ftypSize = -1, mdatStart = -1, mdatSize = 0, moovStart = -1, moovSize = 0;
-            long i = 0;
-            while (i + 8 <= data.Length)
-            {
-                var sz = ReadUInt32BE(data, i);
-                var type = Encoding.Latin1.GetString(data, (int)i + 4, 4);
-                long size;
-                var hdr = 8;
-                if (sz == 1) { size = (long)ReadUInt64BE(data, i + 8); hdr = 16; }
-                else if (sz == 0) size = data.Length - i;
-                else size = sz;
-                if (size < hdr || i + size > data.Length) break;
-                if (type == "ftyp") ftypSize = size;
-                else if (type == "mdat" && mdatStart < 0) { mdatStart = i; mdatSize = size; }
-                else if (type == "moov") { moovStart = i; moovSize = size; }
-                i += size;
-            }
-            if (ftypSize < 0 || mdatStart < 0 || moovStart < 0) return data;
-
-            // ② 递归重建 moov：剔除 iPhone 专有盒，父盒 size 重算
-            var moovHeaderLen = ReadUInt32BE(data, moovStart) == 1 ? 16L : 8L; // 兼容 64 位盒头(ext)
-            var newMoovChildren = RebuildDropContainers(data, moovStart + moovHeaderLen, moovStart + moovSize, "moov");
-            var newMoovSize = 8L + newMoovChildren.Length;
-
-            // ③ 计算 Δ 并对新建 moov 内的全部 stco/co64 偏移统一平移
-            var oldDataStart = mdatStart + 8;            // 旧 mdat 数据区起点
-            var newDataStart = ftypSize + 8;             // 新布局 ftyp 之后紧跟 mdat，数据区在 mdat 头后
-            var delta = newDataStart - oldDataStart;
-            if (delta != 0) PatchChunkOffsets(newMoovChildren, 0, newMoovChildren.Length, delta);
-
-            // ④ 拼装输出：ftyp(原封不变) + mdat(头重写+payload逐字) + moov(重写)
-            var ftypBox = new byte[ftypSize];
-            Buffer.BlockCopy(data, 0, ftypBox, 0, (int)ftypSize); // ftyp 恒在偏移 0
-
-            // MemoryStream 容量参数为 int；短视频体积远小于 2GB，long 各长度转 int 无溢出
-            using var ms = new MemoryStream((int)(ftypBox.Length + mdatSize + newMoovSize));
-            ms.Write(ftypBox, 0, ftypBox.Length);
-            var mdatHdr = new byte[8];
-            WriteUInt32BE(mdatHdr, 0, (uint)mdatSize);
-            mdatHdr[4] = (byte)'m'; mdatHdr[5] = (byte)'d'; mdatHdr[6] = (byte)'a'; mdatHdr[7] = (byte)'t';
-            ms.Write(mdatHdr, 0, 8);
-            ms.Write(data, (int)(mdatStart + 8), (int)(mdatSize - 8)); // mdat 数据区逐字保留
-            var moovHdr = new byte[8];
-            WriteUInt32BE(moovHdr, 0, (uint)newMoovSize);
-            moovHdr[4] = (byte)'m'; moovHdr[5] = (byte)'o'; moovHdr[6] = (byte)'o'; moovHdr[7] = (byte)'v';
-            ms.Write(moovHdr, 0, 8);
-            ms.Write(newMoovChildren, 0, newMoovChildren.Length);
-            return ms.ToArray();
-        }
-
-        /// <summary>
-        /// 递归重建一个容器盒的子盒区域[start,end)：按容器类型剔除对应 iPhone 专有盒，
-        /// 并沿容器树向下重建（moov→trak→mdia→minf→stbl）。被保留的子盒原封复制（含各自头部），
-        /// 被剔除者跳过；返回的子盒序列将由调用方补写新的父盒 size。
-        /// </summary>
-        private static byte[] RebuildDropContainers(byte[] data, long start, long end, string containerType)
-        {
-            var drop = new HashSet<string>(StringComparer.Ordinal);
-            var recurse = new HashSet<string>(StringComparer.Ordinal);
-            switch (containerType)
-            {
-                case "moov": recurse.Add("trak"); break;
-                case "trak": drop.UnionWith(new[] { "edts", "tapt" }); recurse.Add("mdia"); break;
-                case "mdia": recurse.Add("minf"); break;
-                case "minf": recurse.Add("stbl"); break;
-                case "stbl": drop.UnionWith(new[] { "ctts", "cslg", "sdtp", "sgpd", "sbgp" }); break;
-            }
-
-            using var ms = new MemoryStream();
-            var idx = start;
-            while (idx + 8 <= end)
-            {
-                var sz = ReadUInt32BE(data, idx);
-                var type = Encoding.Latin1.GetString(data, (int)idx + 4, 4);
-                long size;
-                var hdr = 8;
-                if (sz == 1) { size = (long)ReadUInt64BE(data, idx + 8); hdr = 16; }
-                else if (sz == 0) size = end - idx;
-                else size = sz;
-                if (size < hdr || idx + size > end) break;
-
-                if (drop.Contains(type)) { idx += size; continue; }
-
-                if (recurse.Contains(type))
-                {
-                    var inner = RebuildDropContainers(data, idx + hdr, idx + size, type);
-                    var hdrBuf = new byte[8]; // 统一按 32 位 size 写父盒头（短视频 volume ≪ 4GB）
-                    WriteUInt32BE(hdrBuf, 0, (uint)(8 + inner.Length));
-                    ms.Write(hdrBuf, 0, 8);
-                    ms.Write(Encoding.Latin1.GetBytes(type), 0, 4);
-                    ms.Write(inner, 0, inner.Length);
-                }
-                else
-                {
-                    var seg = new byte[size];
-                    Buffer.BlockCopy(data, (int)idx, seg, 0, (int)size);
-                    ms.Write(seg, 0, seg.Length);
-                }
-                idx += size;
-            }
-            return ms.ToArray();
-        }
-
-        /// <summary>
-        /// 判断一个 trak 是否为 mebx 元数据轨道：其 stsd 首个 sample entry 类型为 mebx
-        /// </summary>
-        private static bool IsMebxTrack(byte[] data, long trakStart, long trakEnd)
-        {
-            var firstEntry = "";
-            if (!FindFirstSampleEntry(data, trakStart, trakEnd, out firstEntry)) return false;
-            return firstEntry == "mebx";
-        }
-
-        /// <summary>
-        /// 递归在当前容器（通常是 trak）内查找 stsd，读取其首个 sample entry 的 4 字节类型
-        /// </summary>
-        private static bool FindFirstSampleEntry(byte[] data, long start, long end, out string firstType)
-        {
-            firstType = "";
-            var i = start;
-            while (i + 8 <= end)
-            {
-                var s32 = ReadUInt32BE(data, i);
-                var type = Encoding.Latin1.GetString(data, (int)i + 4, 4);
-                long size;
-                var ext = false;
-                if (s32 == 1) { size = (long)ReadUInt64BE(data, i + 8); ext = true; }
-                else if (s32 == 0) size = end - i;
-                else size = s32;
-                if (size < 8 || i + size > end) break;
-
-                if (type == "stsd")
-                {
-                    // stsd 布局：盒子头 + version/flags(4) + entry_count(4) +
-                    // 首个 sample entry，其类型 fourcc 位于 entry 自身的 size(4) 之后，
-                    // 即 inner+8 为 entry 的 size 字段、inner+12 才是类型。故取 inner+12。
-                    var inner = i + (ext ? 16 : 8);
-                    var entryCount = ReadUInt32BE(data, inner + 4);
-                    if (entryCount >= 1)
-                    {
-                        firstType = Encoding.Latin1.GetString(data, (int)(inner + 12), 4);
-                        return true;
-                    }
-                }
-
-                // 深入子容器继续查找（stsd 通常位于 mdia>minf>stbl 下层）
-                if (FindFirstSampleEntry(data, i + (ext ? 16 : 8), i + size, out firstType)) return true;
-                i += size;
-            }
-            return false;
-        }
-
-        // ── 大端读写工具（MP4 家族均为大端）────────────────────────────
-
-        private static uint ReadUInt32BE(byte[] b, long off)
-            => ((uint)b[off] << 24) | ((uint)b[off + 1] << 16) | ((uint)b[off + 2] << 8) | b[off + 3];
-
-        private static ulong ReadUInt64BE(byte[] b, long off)
-            => ((ulong)ReadUInt32BE(b, off) << 32) | ReadUInt32BE(b, off + 4);
-
-        private static void WriteUInt32BE(byte[] b, long off, uint v)
-        {
-            b[off] = (byte)(v >> 24);
-            b[off + 1] = (byte)(v >> 16);
-            b[off + 2] = (byte)(v >> 8);
-            b[off + 3] = (byte)v;
-        }
-
-        private static void WriteUInt64BE(byte[] b, long off, ulong v)
-        {
-            WriteUInt32BE(b, off, (uint)(v >> 32));
-            WriteUInt32BE(b, off + 4, (uint)v);
         }
 
         /// <summary>
@@ -1043,7 +690,7 @@ namespace WeiboAlbumDownloader.Helpers
             string? tempMerged = null;
             try
             {
-                // ① MOV → MP4 换标（改写 ftyp 品牌，并剥离 iPhone「mebx」元数据轨道）
+                // ① MOV → MP4 换标（FFmpeg remux；缺失时仅换 ftyp 品牌）
                 tempRelabel = Path.Combine(tempDir, $"{Guid.NewGuid():N}.mp4");
                 RelabelMovToMp4(mov, tempRelabel);
 
