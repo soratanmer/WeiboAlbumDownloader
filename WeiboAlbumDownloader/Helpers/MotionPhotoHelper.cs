@@ -68,7 +68,8 @@ namespace WeiboAlbumDownloader.Helpers
     /// <remarks>
     /// 目标格式：<br/>
     /// 1. 物理结构 = 标准 JPEG 封面（前段）+ 尾部二进制拼接的 MP4 微视频；<br/>
-    /// 2. 在 JPEG 头部注入 Google GCamera XMP 容器描述（含 MicroVideoOffset = 内嵌视频字节长度）；<br/>
+    /// 2. 在 JPEG 头部注入 Google GCamera XMP 容器描述（MicroVideoOffset = 内嵌 MP4 的起始偏移，
+///    Item:Length = 内嵌视频字节长度）；<br/>
     /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
     /// 因微博下载的实况视频均为 H.264(avc1)+AAC(mp4a)，MOV 与 MP4 共享 ISOBMFF 盒结构，
     /// 故可仅改写 ftyp 品牌字节即可安全换标为 MP4 容器，无需重新编码。
@@ -312,16 +313,19 @@ namespace WeiboAlbumDownloader.Helpers
         /// <summary>
         /// 构建 Google GCamera 动态照片 XMP 的完整字节（UTF-8）
         /// </summary>
-        /// <param name="videoLength">内嵌视频的字节长度（MicroVideoOffset / Item:Length 的取值）</param>
+        /// <param name="videoLength">内嵌视频的字节长度（写入 Item:Length）</param>
+        /// <param name="offset">内嵌视频(MP4)在最终合并文件中的起始字节偏移（写入 MicroVideoOffset）</param>
         /// <param name="presentationTimestampUs">代表帧时间戳（微秒）；Demo 场景可传 0</param>
         /// <returns>可直接注入 JPEG 的 XMP 字节</returns>
-        public static byte[] BuildGPhotoXmp(long videoLength, long presentationTimestampUs = 0)
+        public static byte[] BuildGPhotoXmp(long videoLength, long offset = 0, long presentationTimestampUs = 0)
         {
             if (videoLength < 0) throw new ArgumentOutOfRangeException(nameof(videoLength));
+            if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (presentationTimestampUs < 0) throw new ArgumentOutOfRangeException(nameof(presentationTimestampUs));
 
             var inv = CultureInfo.InvariantCulture;
-            var offset = videoLength.ToString(inv);
+            var lenStr = videoLength.ToString(inv);
+            var offStr = offset.ToString(inv);
             var ts = presentationTimestampUs.ToString(inv);
 
             var xmp = $@"
@@ -336,7 +340,7 @@ namespace WeiboAlbumDownloader.Helpers
       GCamera:MotionPhotoPresentationTimestampUs=""{ts}""
       GCamera:MicroVideo=""1""
       GCamera:MicroVideoVersion=""1""
-      GCamera:MicroVideoOffset=""{offset}""
+      GCamera:MicroVideoOffset=""{offStr}""
       GCamera:MicroVideoPresentationTimestampUs=""{ts}"">
       <Container:Directory>
         <rdf:Seq>
@@ -349,7 +353,7 @@ namespace WeiboAlbumDownloader.Helpers
             <Container:Item
               Item:Mime=""video/mp4""
               Item:Semantic=""MotionPhoto""
-              Item:Length=""{offset}""
+              Item:Length=""{lenStr}""
               Item:Padding=""0""/>
           </rdf:li>
         </rdf:Seq>
@@ -691,8 +695,21 @@ namespace WeiboAlbumDownloader.Helpers
                 RelabelMovToMp4(mov, tempRelabel);
 
                 // ② 构建并注入 GCamera XMP（presentationTimestamp 暂用 0 回退）
-                var videoLength = fileInfo.Length;
-                var xmp = BuildGPhotoXmp(videoLength, 0);
+                //    内嵌视频字节数 = mov 长度(Item:Length)；MicroVideoOffset = 内嵌 MP4 在合并文件中的起始偏移。
+                //    因注入 XMP 会改变封面长度、而偏移又写 XMP 内（自指），故用定长逼近迭代收敛偏移。
+                var videoBytes = fileInfo.Length;
+                var jpgLen = new FileInfo(jpg).Length;
+                long offset = 0;
+                byte[] xmp = new byte[0];
+                for (var i = 0; i < 8; i++)
+                {
+                    xmp = BuildGPhotoXmp(videoBytes, offset, 0);
+                    // InjectXmpToJpeg 在 SOI 后新增一段 APP1：FFE1(2) + 长度(2) + 前缀(29) + XMP。
+                    // 故注入后封面长度 = 原封面 + 33 + XMP长度 = 内嵌 MP4 的起始偏移。
+                    var next = jpgLen + 33 + xmp.Length;
+                    if (next == offset) break;
+                    offset = next;
+                }
                 tempJpgXmp = Path.Combine(tempDir, $"{Guid.NewGuid():N}_xmpped.jpg");
                 InjectXmpToJpeg(jpg, xmp, tempJpgXmp);
 
@@ -701,7 +718,7 @@ namespace WeiboAlbumDownloader.Helpers
                 var totalLength = Concat(tempJpgXmp, tempRelabel, tempMerged);
 
                 // ④ 校验：输出必须完整包含封面与视频
-                if (totalLength <= videoLength)
+                if (totalLength <= videoBytes)
                 {
                     throw new InvalidDataException($"合成校验失败：输出 {totalLength} 字节未完整包含内嵌视频。");
                 }
