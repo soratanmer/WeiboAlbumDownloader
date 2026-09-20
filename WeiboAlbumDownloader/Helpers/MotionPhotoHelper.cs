@@ -644,8 +644,8 @@ namespace WeiboAlbumDownloader.Helpers
             if (ftypSize < 0 || mdatStart < 0 || moovStart < 0) return data;
 
             // ② 递归重建 moov：剔除 iPhone 专有盒，父盒 size 重算
-            var moovHdr = ReadUInt32BE(data, moovStart) == 1 ? 16L : 8L; // 兼容 64 位盒头(ext)
-            var newMoovChildren = RebuildDropContainers(data, moovStart + moovHdr, moovStart + moovSize, "moov");
+            var moovHeaderLen = ReadUInt32BE(data, moovStart) == 1 ? 16L : 8L; // 兼容 64 位盒头(ext)
+            var newMoovChildren = RebuildDropContainers(data, moovStart + moovHeaderLen, moovStart + moovSize, "moov");
             var newMoovSize = 8L + newMoovChildren.Length;
 
             // ③ 计算 Δ 并对新建 moov 内的全部 stco/co64 偏移统一平移
