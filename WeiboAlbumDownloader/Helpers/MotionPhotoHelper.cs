@@ -658,7 +658,8 @@ namespace WeiboAlbumDownloader.Helpers
             var ftypBox = new byte[ftypSize];
             Buffer.BlockCopy(data, 0, ftypBox, 0, (int)ftypSize); // ftyp 恒在偏移 0
 
-            using var ms = new MemoryStream(ftypBox.Length + mdatSize + newMoovSize);
+            // MemoryStream 容量参数为 int；短视频体积远小于 2GB，long 各长度转 int 无溢出
+            using var ms = new MemoryStream((int)(ftypBox.Length + mdatSize + newMoovSize));
             ms.Write(ftypBox, 0, ftypBox.Length);
             var mdatHdr = new byte[8];
             WriteUInt32BE(mdatHdr, 0, (uint)mdatSize);
