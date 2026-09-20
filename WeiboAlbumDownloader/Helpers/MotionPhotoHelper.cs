@@ -214,6 +214,15 @@ namespace WeiboAlbumDownloader.Helpers
                 }
             }
 
+            // 文件名兜底：同目录中与 mov 基础卷名(去掉扩展名)完全一致的 jpg 视为配对
+            var movName = Path.GetFileNameWithoutExtension(mov);
+            var byName = availableJpgs.FirstOrDefault(j =>
+                string.Equals(Path.GetFileNameWithoutExtension(j), movName, StringComparison.OrdinalIgnoreCase));
+            if (byName is not null)
+            {
+                return byName;
+            }
+
             // 唯一性兜底：组内只剩 1 张未被消费的 jpg 且仅有 1 个 mov，则唯一配对
             if (availableJpgs.Count == 1)
             {
@@ -728,24 +737,32 @@ namespace WeiboAlbumDownloader.Helpers
                 throw new FileNotFoundException("实况视频不存在。", movPath);
             }
 
-            // ① 读取 mov 的 ContentIdentifier 作精确配对信号
+            var dir = Path.GetDirectoryName(movPath) ?? throw new InvalidDataException("无法解析实况视频目录。");
+
+            // ① 优先以 ContentIdentifier 作精确配对信号（mov 与封面 jpg 各存一份相同 UUID）
+            string? matchedJpg = null;
             var movCid = ReadContentIdentifier(movPath, ContentIdentifierKind.Video);
-            if (string.IsNullOrEmpty(movCid))
+            if (!string.IsNullOrEmpty(movCid))
             {
-                skipReason = "无法读取实况视频 ContentIdentifier";
-                return false;
+                foreach (var jpg in Directory.EnumerateFiles(dir).Where(f => IsJpg(f)))
+                {
+                    if (string.Equals(ReadContentIdentifier(jpg, ContentIdentifierKind.Photo), movCid, StringComparison.Ordinal))
+                    {
+                        matchedJpg = jpg;
+                        break;
+                    }
+                }
             }
 
-            // ② 在同级目录(非递归)按相同 UUID 定位配对封面 jpg
-            var dir = Path.GetDirectoryName(movPath) ?? throw new InvalidDataException("无法解析实况视频目录。");
-            string? matchedJpg = null;
-            foreach (var jpg in Directory.EnumerateFiles(dir).Where(f => IsJpg(f)))
+            // ② 文件名兜底：同级目录中与 mov 基础卷名(去掉扩展名)完全一致的 jpg 视为配对。
+            //    配对命名下载下封面/mov 天然同名，即使 mov 或封面丢失 CID 仍能定位。
+            if (string.IsNullOrEmpty(matchedJpg))
             {
-                if (string.Equals(ReadContentIdentifier(jpg, ContentIdentifierKind.Photo), movCid, StringComparison.Ordinal))
-                {
-                    matchedJpg = jpg;
-                    break;
-                }
+                var movName = Path.GetFileNameWithoutExtension(movPath);
+                matchedJpg = Directory.EnumerateFiles(dir)
+                    .Where(f => IsJpg(f))
+                    .FirstOrDefault(j => string.Equals(
+                        Path.GetFileNameWithoutExtension(j), movName, StringComparison.OrdinalIgnoreCase));
             }
 
             if (string.IsNullOrEmpty(matchedJpg))

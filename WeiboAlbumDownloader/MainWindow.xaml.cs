@@ -913,13 +913,47 @@ namespace WeiboAlbumDownloader
                                         Debug.WriteLine(fileName);
 
                                         int id = 1;
-                                        //下载获取图片列表中的图片原图
-                                        foreach (var item in originalPics)
+                                        //构造统一媒体队列：优先用 pics 的逐图权威结构（图按发布顺序），
+                                        //实况 mov 从 Mblog.LivePhoto 按实况出现顺序取值，保证封面与 mov 成对命名(_k.jpg/_k.mov)
+                                        var mediaItems = new List<(string JpgUrl, string? MovUrl)>();
+                                        bool usedPicsMedia = false;
+                                        if (card?.Mblog?.Pics is { Count: > 0 } picsList)
+                                        {
+                                            usedPicsMedia = true;
+                                            int liveIndex = 0;
+                                            foreach (var pic in picsList)
+                                            {
+                                                if (string.IsNullOrEmpty(pic?.Pid)) continue;
+                                                bool isLive = !string.IsNullOrEmpty(pic.VideoSrc)
+                                                    || string.Equals(pic.Type, "livephoto", StringComparison.OrdinalIgnoreCase);
+                                                string? movUrl = null;
+                                                if (isLive)
+                                                {
+                                                    if (liveIndex < originalLivePhotos.Count)
+                                                    {
+                                                        movUrl = originalLivePhotos[liveIndex++];
+                                                    }
+                                                    else
+                                                    {
+                                                        AppendLog("实况 mov 超出 LivePhoto 可用数量，跳过该实况视频：" + pic.Pid, MessageEnum.Warning);
+                                                    }
+                                                }
+                                                mediaItems.Add(("https://wx4.sinaimg.cn/large/" + pic.Pid + ".jpg", movUrl));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            //回退：无 pics 数组（罕见），仅按 PicIds 下图，实况由原 LivePhoto 列表靠 CID 兜底
+                                            foreach (var pid in originalPics) mediaItems.Add((pid, null));
+                                        }
+
+                                        //逐张下载封面图；实况图连带下载同名 _k.mov 并自动合并
+                                        foreach (var item in mediaItems)
                                         {
                                             if (isSkip)
                                                 break;
 
-                                            if (string.IsNullOrEmpty(item))
+                                            if (string.IsNullOrEmpty(item.JpgUrl))
                                                 continue;
                                             var fileNamee = fileName + $"_{id}.jpg";
                                             //已存在的文件超过设置值，判定该用户下载过了
@@ -927,21 +961,23 @@ namespace WeiboAlbumDownloader
                                             {
                                                 AppendLog($"已存在的文件{countDownloadedSkipToNextUser}超过设置值{settings.CountDownloadedSkipToNextUser}，跳到下一个用户", MessageEnum.Info);
                                                 isSkip = true;
+                                                break;
                                             }
 
-                                            //已经下载过的跳过
+                                            //已经下载过的跳过（实况的 mov 也一并跳过，保证编号与图片位号对齐）
                                             if (File.Exists(fileNamee))
                                             {
                                                 AppendLog("文件已存在，跳过下载" + Path.GetFullPath(fileNamee), MessageEnum.Warning);
                                                 countDownloadedSkipToNextUser++;
                                                 await Task.Delay(500);
+                                                id++;
                                                 continue;
                                             }
 
-                                            //传入图片/视频的名字，开始下载图片/视频
+                                            //下载封面图
                                             try
                                             {
-                                                await HttpHelper.GetAsync<AlbumDetailModel>(item, dataSource, cookie!, fileNamee);
+                                                await HttpHelper.GetAsync<AlbumDetailModel>(item.JpgUrl, dataSource, cookie!, fileNamee);
 
                                                 //修改文件日期时间为发博的时间
                                                 SetFileTime(fileNamee, timestamp);
@@ -950,8 +986,45 @@ namespace WeiboAlbumDownloader
                                             }
                                             catch (Exception ex)
                                             {
-                                                AppendLog($"文件下载失败，原始url：{item}，下载路径{fileNamee}", MessageEnum.Error);
+                                                AppendLog($"文件下载失败，原始url：{item.JpgUrl}，下载路径{fileNamee}", MessageEnum.Error);
                                             }
+
+                                            //实况图：成对下载同名 _k.mov 并自动合并（配对优先 CID，失败以文件名兜底）
+                                            if (!string.IsNullOrEmpty(item.MovUrl))
+                                            {
+                                                var movFile = fileName + $"_{id}.mov";
+                                                if (File.Exists(movFile))
+                                                {
+                                                    AppendLog("文件已存在，跳过下载" + Path.GetFullPath(movFile), MessageEnum.Warning);
+                                                    countDownloadedSkipToNextUser++;
+                                                }
+                                                else
+                                                {
+                                                    try
+                                                    {
+                                                        await HttpHelper.GetAsync<AlbumDetailModel>(item.MovUrl, dataSource, cookie!, movFile);
+                                                        SetFileTime(movFile, timestamp);
+                                                        AppendLog("已完成 " + Path.GetFileName(movFile), MessageEnum.Success);
+
+                                                        try
+                                                        {
+                                                            if (MotionPhotoHelper.MergeByMov(movFile, out var mergeSkip))
+                                                                AppendLog("已自动合并为动态照片：" + Path.GetFileName(movFile), MessageEnum.Success);
+                                                            else
+                                                                AppendLog("实况照片未合并（" + mergeSkip + "）：" + Path.GetFileName(movFile), MessageEnum.Warning);
+                                                        }
+                                                        catch (Exception mergeEx)
+                                                        {
+                                                            AppendLog("自动合并实况照片失败，保留原始文件：" + mergeEx.Message, MessageEnum.Error);
+                                                        }
+                                                    }
+                                                    catch (Exception ex)
+                                                    {
+                                                        AppendLog($"文件下载失败，原始url：{item.MovUrl}，下载路径{movFile}", MessageEnum.Error);
+                                                    }
+                                                }
+                                            }
+
                                             id++;
                                         }
                                         if (settings!.EnableDownloadVideo)
@@ -997,7 +1070,8 @@ namespace WeiboAlbumDownloader
                                                 id++;
                                             }
                                         }
-                                        if (settings!.EnableDownloadLivePhoto)
+                                        //回退路径：仅当未用 pics 逐图结构时（无 pics 数组的罕见帖），才按 LivePhoto 列表下载，靠 CID 兜底
+                                        if (!usedPicsMedia && settings!.EnableDownloadLivePhoto)
                                         {
                                             foreach (var item in originalLivePhotos)
                                             {
