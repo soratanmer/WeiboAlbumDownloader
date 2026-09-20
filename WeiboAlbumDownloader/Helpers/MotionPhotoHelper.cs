@@ -325,42 +325,22 @@ namespace WeiboAlbumDownloader.Helpers
             if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (presentationTimestampUs < 0) throw new ArgumentOutOfRangeException(nameof(presentationTimestampUs));
 
-            var inv = CultureInfo.InvariantCulture;
-            var lenStr = videoLength.ToString(inv);
-            var offStr = offset.ToString(inv);
-            var ts = presentationTimestampUs.ToString(inv);
+            // 与「确定可被 Windows Photos / 小米相册识别」的 QQ 参考文件保持一致的极简 GCamera 微电影元数据。
+            // 参考文件（能播）不含 MotionPhoto / Container:Directory / Item:Length，仅四个字段：
+            //   GCamera:MicroVideoVersion / MicroVideo / MicroVideoOffset / MicroVideoPresentationTimestampUs。
+            // Windows Photos 依据 MicroVideo="1" + MicroVideoOffset 定位内嵌视频；繁复的 Container
+            // 结构并非必需，反而可能干扰浅解析。故此处严格对齐参考文件。
+            var offStr = offset.ToString(CultureInfo.InvariantCulture);
 
             var xmp = $@"
 <x:xmpmeta xmlns:x=""adobe:ns:meta/"" x:xmptk=""Adobe XMP Core 5.1.0-jc003"">
   <rdf:RDF xmlns:rdf=""http://www.w3.org/1999/02/22-rdf-syntax-ns#"">
     <rdf:Description rdf:about=""""
-      xmlns:GCamera=""http://ns.google.com/photos/1.0/camera/""
-      xmlns:Container=""http://ns.google.com/photos/1.0/container/""
-      xmlns:Item=""http://ns.google.com/photos/1.0/container/item/""
-      GCamera:MotionPhoto=""1""
-      GCamera:MotionPhotoVersion=""1""
-      GCamera:MotionPhotoPresentationTimestampUs=""{ts}""
-      GCamera:MicroVideo=""1""
+        xmlns:GCamera=""http://ns.google.com/photos/1.0/camera/""
       GCamera:MicroVideoVersion=""1""
+      GCamera:MicroVideo=""1""
       GCamera:MicroVideoOffset=""{offStr}""
-      GCamera:MicroVideoPresentationTimestampUs=""{ts}"">
-      <Container:Directory>
-        <rdf:Seq>
-          <rdf:li rdf:parseType=""Resource"">
-            <Container:Item
-              Item:Mime=""image/jpeg""
-              Item:Semantic=""Primary""/>
-          </rdf:li>
-          <rdf:li rdf:parseType=""Resource"">
-            <Container:Item
-              Item:Mime=""video/mp4""
-              Item:Semantic=""MotionPhoto""
-              Item:Length=""{lenStr}""
-              Item:Padding=""0""/>
-          </rdf:li>
-        </rdf:Seq>
-      </Container:Directory>
-    </rdf:Description>
+      GCamera:MicroVideoPresentationTimestampUs=""0""/>
   </rdf:RDF>
 </x:xmpmeta>
 ";

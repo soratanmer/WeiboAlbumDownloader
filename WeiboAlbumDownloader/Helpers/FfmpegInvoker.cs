@@ -63,8 +63,10 @@ namespace WeiboAlbumDownloader.Helpers
             var exe = LocateFfmpeg()
                 ?? throw new FileNotFoundException("未找到 ffmpeg.exe（应随程序一起分发，或加入系统 PATH）。");
 
-            // 第一优先：视频零转码 remux，仅音频重编码 AAC
-            var first = new[] { "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outPath };
+            // 第一优先：视频零转码 remux，仅音频重编码 AAC。
+            // 不加 -movflags +faststart：保持 moov 位于文件尾（ftyp,mdat,moov），
+            // 与「确定可被 Windows Photos 识别」的 QQ 参考文件布局完全一致。
+            var first = new[] { "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", outPath };
             if (RunAndSucceeded(exe, first) && IsNonEmpty(outPath))
             {
                 return outPath;
@@ -72,7 +74,7 @@ namespace WeiboAlbumDownloader.Helpers
 
             // 回退：copy 因源参数不兼容失败 → 真正的 H.264 转码（较慢但保证产出合规 MP4）
             File.Delete(outPath);
-            var fallback = new[] { "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outPath };
+            var fallback = new[] { "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", outPath };
             var err = RunAndCaptureError(exe, fallback);
             if (err == null && IsNonEmpty(outPath))
             {
