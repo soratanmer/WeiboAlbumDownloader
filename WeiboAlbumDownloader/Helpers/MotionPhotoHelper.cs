@@ -444,14 +444,17 @@ namespace WeiboAlbumDownloader.Helpers
             var patched = PatchFtypBrand(bytes, patchLen);
             Buffer.BlockCopy(patched, 0, bytes, 0, patchLen);
 
-            // ② 剥离 iPhone「mebx」元数据轨道（须 moov 位于文件尾部）；失败则回退为仅换标
+            // ② 剥离 iPhone「mebx」元数据轨道，并把 moov 彻底重排为「ftyp,mdat,moov」标准 ISO BMFF 布局：
+            //    剔除 mebx 轨道导致的偏移已由 StripMebxMetadataTrack 处理，再剔除 iPhone 专有盒(edts/tapt/
+            //    ctts/cslg/sdtp/sgpd/sbgp)并统一修正 stco/co64。任一步失败都回退为仅换标，不阻塞合并。
             try
             {
                 bytes = StripMebxMetadataTrack(bytes);
+                bytes = StandardizeMoovToIso(bytes);
             }
             catch
             {
-                // 剥离失败不阻塞合并：仍输出已换标、可被完整播放器识别的 MP4
+                // 标准化失败不阻塞合并：仍输出已换标、可被完整播放器识别的 MP4
             }
 
             File.WriteAllBytes(outPath, bytes);
@@ -606,6 +609,121 @@ namespace WeiboAlbumDownloader.Helpers
                     WriteUInt64BE(data, entryBase + (long)e * 8, (ulong)((long)off + delta));
                 }
             }
+        }
+
+        /// <summary>
+        /// 把 moov 彻底重排为标准 ISO BMFF 布局「ftyp,mdat,moov」（对齐可被小米完整识别的 QQ 参考文件），
+        /// 并剔除 iPhone QuickTime 专有扩展盒：trak 层剔除 edts/tapt，stbl 层剔除 ctts/cslg/sdtp/sgpd/sbgp，
+        /// 顶层 wide/free 因不复制而自然消失。所有媒体 sample 数据(mdat payload)逐字保留、零转码。
+        /// <para>
+        /// 入参 <paramref name="data"/> 为纯 MP4 字节数组（ftyp 位于偏移 0），故 stco/co64 的"绝对文件偏移"
+        /// 即"相对 ftyp 的偏移"。重排后 mdat 数据区由 oldDataStart 平移到 newDataStart，对全部 sample 偏移
+        /// 统一加 Δ = newDataStart − oldDataStart 即可，样本自身字节不动。
+        /// </para>
+        /// </summary>
+        private static byte[] StandardizeMoovToIso(byte[] data)
+        {
+            // ① 解析顶层盒子，定位 ftyp、mdat、moov
+            long ftypSize = -1, mdatStart = -1, mdatSize = 0, moovStart = -1, moovSize = 0;
+            long i = 0;
+            while (i + 8 <= data.Length)
+            {
+                var sz = ReadUInt32BE(data, i);
+                var type = Encoding.Latin1.GetString(data, (int)i + 4, 4);
+                long size;
+                var hdr = 8;
+                if (sz == 1) { size = (long)ReadUInt64BE(data, i + 8); hdr = 16; }
+                else if (sz == 0) size = data.Length - i;
+                else size = sz;
+                if (size < hdr || i + size > data.Length) break;
+                if (type == "ftyp") ftypSize = size;
+                else if (type == "mdat" && mdatStart < 0) { mdatStart = i; mdatSize = size; }
+                else if (type == "moov") { moovStart = i; moovSize = size; }
+                i += size;
+            }
+            if (ftypSize < 0 || mdatStart < 0 || moovStart < 0) return data;
+
+            // ② 递归重建 moov：剔除 iPhone 专有盒，父盒 size 重算
+            var moovHdr = ReadUInt32BE(data, moovStart) == 1 ? 16L : 8L; // 兼容 64 位盒头(ext)
+            var newMoovChildren = RebuildDropContainers(data, moovStart + moovHdr, moovStart + moovSize, "moov");
+            var newMoovSize = 8L + newMoovChildren.Length;
+
+            // ③ 计算 Δ 并对新建 moov 内的全部 stco/co64 偏移统一平移
+            var oldDataStart = mdatStart + 8;            // 旧 mdat 数据区起点
+            var newDataStart = ftypSize + 8;             // 新布局 ftyp 之后紧跟 mdat，数据区在 mdat 头后
+            var delta = newDataStart - oldDataStart;
+            if (delta != 0) PatchChunkOffsets(newMoovChildren, 0, newMoovChildren.Length, delta);
+
+            // ④ 拼装输出：ftyp(原封不变) + mdat(头重写+payload逐字) + moov(重写)
+            var ftypBox = new byte[ftypSize];
+            Buffer.BlockCopy(data, 0, ftypBox, 0, (int)ftypSize); // ftyp 恒在偏移 0
+
+            using var ms = new MemoryStream(ftypBox.Length + mdatSize + newMoovSize);
+            ms.Write(ftypBox, 0, ftypBox.Length);
+            var mdatHdr = new byte[8];
+            WriteUInt32BE(mdatHdr, 0, (uint)mdatSize);
+            mdatHdr[4] = (byte)'m'; mdatHdr[5] = (byte)'d'; mdatHdr[6] = (byte)'a'; mdatHdr[7] = (byte)'t';
+            ms.Write(mdatHdr, 0, 8);
+            ms.Write(data, (int)(mdatStart + 8), (int)(mdatSize - 8)); // mdat 数据区逐字保留
+            var moovHdr = new byte[8];
+            WriteUInt32BE(moovHdr, 0, (uint)newMoovSize);
+            moovHdr[4] = (byte)'m'; moovHdr[5] = (byte)'o'; moovHdr[6] = (byte)'o'; moovHdr[7] = (byte)'v';
+            ms.Write(moovHdr, 0, 8);
+            ms.Write(newMoovChildren, 0, newMoovChildren.Length);
+            return ms.ToArray();
+        }
+
+        /// <summary>
+        /// 递归重建一个容器盒的子盒区域[start,end)：按容器类型剔除对应 iPhone 专有盒，
+        /// 并沿容器树向下重建（moov→trak→mdia→minf→stbl）。被保留的子盒原封复制（含各自头部），
+        /// 被剔除者跳过；返回的子盒序列将由调用方补写新的父盒 size。
+        /// </summary>
+        private static byte[] RebuildDropContainers(byte[] data, long start, long end, string containerType)
+        {
+            var drop = new HashSet<string>(StringComparer.Ordinal);
+            var recurse = new HashSet<string>(StringComparer.Ordinal);
+            switch (containerType)
+            {
+                case "moov": recurse.Add("trak"); break;
+                case "trak": drop.UnionWith(new[] { "edts", "tapt" }); recurse.Add("mdia"); break;
+                case "mdia": recurse.Add("minf"); break;
+                case "minf": recurse.Add("stbl"); break;
+                case "stbl": drop.UnionWith(new[] { "ctts", "cslg", "sdtp", "sgpd", "sbgp" }); break;
+            }
+
+            using var ms = new MemoryStream();
+            var idx = start;
+            while (idx + 8 <= end)
+            {
+                var sz = ReadUInt32BE(data, idx);
+                var type = Encoding.Latin1.GetString(data, (int)idx + 4, 4);
+                long size;
+                var hdr = 8;
+                if (sz == 1) { size = (long)ReadUInt64BE(data, idx + 8); hdr = 16; }
+                else if (sz == 0) size = end - idx;
+                else size = sz;
+                if (size < hdr || idx + size > end) break;
+
+                if (drop.Contains(type)) { idx += size; continue; }
+
+                if (recurse.Contains(type))
+                {
+                    var inner = RebuildDropContainers(data, idx + hdr, idx + size, type);
+                    var hdrBuf = new byte[8]; // 统一按 32 位 size 写父盒头（短视频 volume ≪ 4GB）
+                    WriteUInt32BE(hdrBuf, 0, (uint)(8 + inner.Length));
+                    ms.Write(hdrBuf, 0, 8);
+                    ms.Write(Encoding.Latin1.GetBytes(type), 0, 4);
+                    ms.Write(inner, 0, inner.Length);
+                }
+                else
+                {
+                    var seg = new byte[size];
+                    Buffer.BlockCopy(data, (int)idx, seg, 0, (int)size);
+                    ms.Write(seg, 0, seg.Length);
+                }
+                idx += size;
+            }
+            return ms.ToArray();
         }
 
         /// <summary>
