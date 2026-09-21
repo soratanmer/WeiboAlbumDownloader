@@ -69,12 +69,13 @@ namespace WeiboAlbumDownloader.Helpers
     /// <remarks>
     /// 目标格式：<br/>
     /// 1. 物理结构 = 标准 JPEG 封面（前段）+ 尾部二进制拼接的 MP4 微视频；<br/>
-    /// 2. 在 JPEG 头部注入 Google GCamera XMP 容器描述（MicroVideoOffset = 内嵌 MP4 的起始偏移，
-    ///    Item:Length = 内嵌视频字节长度）；<br/>
+    /// 2. 在 JPEG 头部注入 Google GCamera XMP（极简微电影元数据）。<br/>
+    ///    GCamera:MicroVideoOffset 语义为「尾部内嵌微视频的字节长度」，解析器按
+    ///    视频起点 = 文件总长 − MicroVideoOffset 反推（已验证可播放的 QQ 参考文件如此取值）；<br/>
     /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
-    /// 内嵌 MP4 由 <see cref="FfmpegInvoker.RemuxToMp4"/> 用 FFmpeg 重封装：moov 前置(+faststart)、
-    /// 音频重编码为标准 AAC、剔除 iPhone 专有扩展盒(mebx/edts/tapt/ctts等)并重建时序表，
-    /// 产出主流播放器（Windows Photos / 小米相册）均可解析的合规容器。FFmpeg 缺失时退化为仅换标。
+    /// 内嵌 MP4 由 <see cref="FfmpegInvoker.RemuxToMp4"/> 用 FFmpeg 重封装：剔除 iPhone 专有扩展盒
+    /// (mebx/edts/tapt/ctts等)、音频重编码为标准 AAC 并重建时序表；moov 保持位于文件尾(ftyp,mdat,moov)，
+    /// 与 QQ 参考文件一致。FFmpeg 缺失时退化为仅换标。
     /// </remarks>
     public static class MotionPhotoHelper
     {
@@ -315,9 +316,9 @@ namespace WeiboAlbumDownloader.Helpers
         /// <summary>
         /// 构建 Google GCamera 动态照片 XMP 的完整字节（UTF-8）
         /// </summary>
-        /// <param name="videoLength">内嵌视频的字节长度（写入 Item:Length）</param>
-        /// <param name="offset">内嵌视频(MP4)在最终合并文件中的起始字节偏移（写入 MicroVideoOffset）</param>
-        /// <param name="presentationTimestampUs">代表帧时间戳（微秒）；Demo 场景可传 0</param>
+        /// <param name="videoLength">内嵌视频的字节长度（写入 MicroVideoOffset，语义为尾部尾部长度）</param>
+        /// <param name="offset">保留参数，当前未参与输出（MicroVideoOffset 已改为写入 videoLength）</param>
+        /// <param name="presentationTimestampUs">保留参数，当前固定写 0</param>
         /// <returns>可直接注入 JPEG 的 XMP 字节</returns>
         public static byte[] BuildGPhotoXmp(long videoLength, long offset = 0, long presentationTimestampUs = 0)
         {
@@ -326,11 +327,13 @@ namespace WeiboAlbumDownloader.Helpers
             if (presentationTimestampUs < 0) throw new ArgumentOutOfRangeException(nameof(presentationTimestampUs));
 
             // 与「确定可被 Windows Photos / 小米相册识别」的 QQ 参考文件保持一致的极简 GCamera 微电影元数据。
-            // 参考文件（能播）不含 MotionPhoto / Container:Directory / Item:Length，仅四个字段：
-            //   GCamera:MicroVideoVersion / MicroVideo / MicroVideoOffset / MicroVideoPresentationTimestampUs。
-            // Windows Photos 依据 MicroVideo="1" + MicroVideoOffset 定位内嵌视频；繁复的 Container
-            // 结构并非必需，反而可能干扰浅解析。故此处严格对齐参考文件。
-            var offStr = offset.ToString(CultureInfo.InvariantCulture);
+            // 参考文件（能播）不含 MotionPhoto / Container:Directory / Item:Length，仅四个字段。
+            //
+            // 关键语义：GCamera:MicroVideoOffset 表示「内嵌微视频的字节长度（尾部长度）」，
+            // 解析器按  视频起点 = 文件总长 − MicroVideoOffset  反推。已验证三个可播放的 QQ 文件
+            // 其 MicroVideoOffset 均精确等于内嵌 MP4 的字节长度；写「距文件头的起始偏移」会导致
+            // 定位失败、无法播放。微视频恒拼接于 JPEG 尾部，故其长度即为该值，与 JPEG/XMP 尺寸无关。
+            var lenStr = videoLength.ToString(CultureInfo.InvariantCulture);
 
             var xmp = $@"
 <x:xmpmeta xmlns:x=""adobe:ns:meta/"" x:xmptk=""Adobe XMP Core 5.1.0-jc003"">
@@ -339,7 +342,7 @@ namespace WeiboAlbumDownloader.Helpers
         xmlns:GCamera=""http://ns.google.com/photos/1.0/camera/""
       GCamera:MicroVideoVersion=""1""
       GCamera:MicroVideo=""1""
-      GCamera:MicroVideoOffset=""{offStr}""
+      GCamera:MicroVideoOffset=""{lenStr}""
       GCamera:MicroVideoPresentationTimestampUs=""0""/>
   </rdf:RDF>
 </x:xmpmeta>
@@ -675,24 +678,13 @@ namespace WeiboAlbumDownloader.Helpers
                 RelabelMovToMp4(mov, tempRelabel);
 
                 // ② 构建并注入 GCamera XMP（presentationTimestamp 暂用 0 回退）
-                //    内嵌视频字节数 = 换标+剥离后的 MP4 实际长度(Item:Length)；
-                //    MicroVideoOffset = 内嵌 MP4 在合并文件中的起始偏移。
-                //    因注入 XMP 会改变封面长度、而偏移又写 XMP 内（自指），故用定长逼近迭代收敛偏移。
+                //    内嵌视频字节数 = 换标+重构后的 MP4 实际长度。
+                //    MicroVideoOffset 语义 = 尾部微视频字节长度（解析器按 起点=总长-offset 反推），
+                //    因视频恒拼接于 JPEG 之后、位于文件尾部，其长度即该值，与 JPEG/XMP 尺寸无关，
+                //    无需任何迭代。
                 var videoBytes = new FileInfo(tempRelabel).Length;
-                var jpgLen = new FileInfo(jpg).Length;
-                long offset = 0;
-                byte[] xmp = new byte[0];
-                for (var i = 0; i < 8; i++)
-                {
-                    xmp = BuildGPhotoXmp(videoBytes, offset, 0);
-                    // InjectXmpToJpeg 在 SOI 后新增一段 APP1：FFE1(2) + 长度(2) + 前缀(29) + XMP。
-                    // 故注入后封面长度 = 原封面 + 33 + XMP长度 = 内嵌 MP4 的起始偏移。
-                    var next = jpgLen + 33 + xmp.Length;
-                    if (next == offset) break;
-                    offset = next;
-                }
                 tempJpgXmp = Path.Combine(tempDir, $"{Guid.NewGuid():N}_xmpped.jpg");
-                InjectXmpToJpeg(jpg, xmp, tempJpgXmp);
+                InjectXmpToJpeg(jpg, BuildGPhotoXmp(videoBytes, 0, 0), tempJpgXmp);
 
                 // ③ 拼接：封面(含 XMP) + 视频
                 tempMerged = Path.Combine(tempDir, $"{Guid.NewGuid():N}_merged.jpg");
