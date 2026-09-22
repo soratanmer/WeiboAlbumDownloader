@@ -64,18 +64,18 @@ namespace WeiboAlbumDownloader.Helpers
 
     /// <summary>
     /// 实况照片批量合并为 Google MotionPhoto。
-    /// 视频容器（MOV→MP4）交由 FFmpeg remux 重建，容器正确性不再靠手工字节手术。
+    /// 不依赖 FFmpeg：视频容器（MOV→MP4）仅做 ftyp 品牌字节修补，容器正确性交给播放器解析。
     /// </summary>
     /// <remarks>
     /// 目标格式：<br/>
     /// 1. 物理结构 = 标准 JPEG 封面（前段）+ 尾部二进制拼接的 MP4 微视频；<br/>
-    /// 2. 在 JPEG 头部注入 Google GCamera XMP（极简微电影元数据）。<br/>
-    ///    GCamera:MicroVideoOffset 语义为「尾部内嵌微视频的字节长度」，解析器按
-    ///    视频起点 = 文件总长 − MicroVideoOffset 反推（已验证可播放的 QQ 参考文件如此取值）；<br/>
+    /// 2. 在 JPEG 头部注入「并集」XMP（legacy MicroVideo + Google 容器 MotionPhoto，
+    ///    同时满足 Windows Photos / 小米 / OPPO / 谷歌 的识别要求）。<br/>
+    ///    GCamera:MicroVideoOffset 与 Container:Directory/Item:Length 均取「尾部内嵌微视频的字节长度」，
+    ///    解析器按 视频起点 = 文件总长 − offset 反推（已验证可播放的 QQ / OPPO 参考文件如此取值）；<br/>
     /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
-    /// 内嵌 MP4 由 <see cref="FfmpegInvoker.RemuxToMp4"/> 用 FFmpeg 重封装：剔除 iPhone 专有扩展盒
-    /// (mebx/edts/tapt/ctts等)、音频重编码为标准 AAC 并重建时序表；moov 保持位于文件尾(ftyp,mdat,moov)，
-    /// 与 QQ 参考文件一致。FFmpeg 缺失时退化为仅换标。
+    /// 内嵌 MP4 仅修正 ftyp 品牌（qt→isom，兼容品牌 qt→mp42），不裁剪 iPhone 专有扩展盒、不重建时序表，
+    /// 依赖解析器兼容性；如需更强容器正确性，可另行集成 FFmpeg。
     /// </remarks>
     public static class MotionPhotoHelper
     {
@@ -314,11 +314,19 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ③ Google GCamera XMP 构建 ───────────────────────────
 
         /// <summary>
-        /// 构建 Google GCamera 动态照片 XMP 的完整字节（UTF-8）
+        /// 构建 Google 动态照片 XMP 的完整字节（UTF-8）
         /// </summary>
-        /// <param name="videoLength">内嵌视频的字节长度（写入 MicroVideoOffset，语义为尾部尾部长度）</param>
-        /// <param name="offset">保留参数，当前未参与输出（MicroVideoOffset 已改为写入 videoLength）</param>
-        /// <param name="presentationTimestampUs">保留参数，当前固定写 0</param>
+        /// <remarks>
+        /// 输出「并集」元数据，一份同时满足多厂商识别：
+        /// 1. legacy 微电影：GCamera:MicroVideo / MicroVideoOffset（Windows Photos / 小米 / 旧解析器）；<br/>
+        /// 2. Google 容器格式：GCamera:MotionPhoto + Container:Directory / Item:Length（OPPO / 谷歌，符合
+        ///    Android Motion Photo 1.0 规范）；<br/>
+        /// 3. 厂商扩展命名空间 OpCamera（OPPO）/ MiCamera（小米），无副作用。
+        /// 结构参考自 XHS_Downloader_Android 的 <c>LivePhotoCreator.generateXmpMetadata</c>。
+        /// </remarks>
+        /// <param name="videoLength">内嵌视频的字节长度（MicroVideoOffset 与 Item:Length 均取其值，语义=尾部视频长度）</param>
+        /// <param name="offset">保留参数，当前未参与输出</param>
+        /// <param name="presentationTimestampUs">封面展示时间戳（写入 MotionPhotoPresentationTimestampUs，默认 0）</param>
         /// <returns>可直接注入 JPEG 的 XMP 字节</returns>
         public static byte[] BuildGPhotoXmp(long videoLength, long offset = 0, long presentationTimestampUs = 0)
         {
@@ -326,24 +334,44 @@ namespace WeiboAlbumDownloader.Helpers
             if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (presentationTimestampUs < 0) throw new ArgumentOutOfRangeException(nameof(presentationTimestampUs));
 
-            // 与「确定可被 Windows Photos / 小米相册识别」的 QQ 参考文件保持一致的极简 GCamera 微电影元数据。
-            // 参考文件（能播）不含 MotionPhoto / Container:Directory / Item:Length，仅四个字段。
-            //
-            // 关键语义：GCamera:MicroVideoOffset 表示「内嵌微视频的字节长度（尾部长度）」，
-            // 解析器按  视频起点 = 文件总长 − MicroVideoOffset  反推。已验证三个可播放的 QQ 文件
-            // 其 MicroVideoOffset 均精确等于内嵌 MP4 的字节长度；写「距文件头的起始偏移」会导致
-            // 定位失败、无法播放。微视频恒拼接于 JPEG 尾部，故其长度即为该值，与 JPEG/XMP 尺寸无关。
+            // 关键语义：GCamera:MicroVideoOffset 与 Container:Item:Length 均表示「内嵌微视频的字节长度（尾部长度）」，
+            // 解析器按 视频起点 = 文件总长 − offset 反推。已验证可播放的 QQ / OPPO 参考文件如此取值；
+            // 若误写「距文件头的起始偏移」会导致定位失败、无法播放。故三个取值均为内嵌视频长度。
             var lenStr = videoLength.ToString(CultureInfo.InvariantCulture);
+            var tsStr = presentationTimestampUs.ToString(CultureInfo.InvariantCulture);
 
             var xmp = $@"
 <x:xmpmeta xmlns:x=""adobe:ns:meta/"" x:xmptk=""Adobe XMP Core 5.1.0-jc003"">
   <rdf:RDF xmlns:rdf=""http://www.w3.org/1999/02/22-rdf-syntax-ns#"">
     <rdf:Description rdf:about=""""
         xmlns:GCamera=""http://ns.google.com/photos/1.0/camera/""
+        xmlns:OpCamera=""http://ns.oplus.com/photos/1.0/camera/""
+        xmlns:MiCamera=""http://ns.xiaomi.com/photos/1.0/camera/""
+        xmlns:Container=""http://ns.google.com/photos/1.0/container/""
+        xmlns:Item=""http://ns.google.com/photos/1.0/container/item/""
+      GCamera:MotionPhoto=""1""
+      GCamera:MotionPhotoVersion=""1""
+      GCamera:MotionPhotoPresentationTimestampUs=""{tsStr}""
+      OpCamera:MotionPhotoPrimaryPresentationTimestampUs=""0""
+      OpCamera:MotionPhotoOwner=""weibo""
+      OpCamera:OLivePhotoVersion=""2""
+      OpCamera:VideoLength=""{lenStr}""
       GCamera:MicroVideoVersion=""1""
       GCamera:MicroVideo=""1""
       GCamera:MicroVideoOffset=""{lenStr}""
-      GCamera:MicroVideoPresentationTimestampUs=""0""/>
+      GCamera:MicroVideoPresentationTimestampUs=""0""
+      MiCamera:XMPMeta=""&lt;?xml version='1.0' encoding='UTF-8' standalone='yes' ?&gt;"">
+      <Container:Directory>
+        <rdf:Seq>
+          <rdf:li rdf:parseType=""Resource"">
+            <Container:Item Item:Mime=""image/jpeg"" Item:Semantic=""Primary"" Item:Length=""0"" Item:Padding=""0""/>
+          </rdf:li>
+          <rdf:li rdf:parseType=""Resource"">
+            <Container:Item Item:Mime=""video/mp4"" Item:Semantic=""MotionPhoto"" Item:Length=""{lenStr}""/>
+          </rdf:li>
+        </rdf:Seq>
+      </Container:Directory>
+    </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
 ";
@@ -401,31 +429,20 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ⑤ MOV → MP4 换标 ───────────────────────────
 
         /// <summary>
-        /// 将 QuickTime MOV 改写为标准 MP4 容器。
-        /// 优先用 FFmpeg remux 重建（moov 前置 +faststart、音频重编码 AAC、剔除 iPhone 专有扩展盒并重建时序表），
-        /// 产出 Windows Photos / 小米相册均可解析的合规容器；FFmpeg 缺失或失败时退化为仅换 ftyp 品牌字节，
-        /// 至少可被完整播放器识别。
+        /// 将 QuickTime MOV 改写为标准 MP4 容器：仅修正 ftyp 品牌字节（qt→isom，兼容品牌 qt→mp42），
+        /// 供完整播放器识别。不做脆弱的 moov 字节手术，避免产出结构自洽性更差的半成品。
+        /// 本实现不依赖 FFmpeg。
         /// </summary>
         /// <param name="movPath">源 MOV 路径</param>
         /// <param name="outPath">输出 MP4 路径（通常为临时文件）</param>
         /// <returns>输出文件完整路径</returns>
         public static string RelabelMovToMp4(string movPath, string outPath)
         {
-            try
-            {
-                FfmpegInvoker.RemuxToMp4(movPath, outPath);
-                return outPath;
-            }
-            catch
-            {
-                // FFmpeg 缺失或失败：退化为仅换标（不改字节结构），不做脆弱的 moov 手术，
-                // 避免产出结构自洽性更差的半成品。
-                var bytes = File.ReadAllBytes(movPath);
-                var header = PatchFtypBrand(bytes, Math.Min(bytes.Length, 64));
-                Buffer.BlockCopy(header, 0, bytes, 0, header.Length);
-                File.WriteAllBytes(outPath, bytes);
-                return outPath;
-            }
+            var bytes = File.ReadAllBytes(movPath);
+            var header = PatchFtypBrand(bytes, Math.Min(bytes.Length, 64));
+            Buffer.BlockCopy(header, 0, bytes, 0, header.Length);
+            File.WriteAllBytes(outPath, bytes);
+            return outPath;
         }
 
         /// <summary>
@@ -673,7 +690,7 @@ namespace WeiboAlbumDownloader.Helpers
             string? tempMerged = null;
             try
             {
-                // ① MOV → MP4 换标（FFmpeg remux；缺失时仅换 ftyp 品牌）
+                // ① MOV → MP4 换标（修饰 ftyp 品牌字节，无需 FFmpeg）
                 tempRelabel = Path.Combine(tempDir, $"{Guid.NewGuid():N}.mp4");
                 RelabelMovToMp4(mov, tempRelabel);
 
