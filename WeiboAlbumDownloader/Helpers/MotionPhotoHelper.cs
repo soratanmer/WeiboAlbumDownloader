@@ -64,7 +64,7 @@ namespace WeiboAlbumDownloader.Helpers
 
     /// <summary>
     /// 实况照片批量合并为 Google MotionPhoto。
-    /// 不依赖 FFmpeg：视频容器（MOV→MP4）仅做 ftyp 品牌字节修补，容器正确性交给播放器解析。
+    /// FFmpeg 优先（remux 剔 mebx、moov faststart、音频 AAC）；缺失或失败时回退为仅 ftyp 品牌字节修补。
     /// </summary>
     /// <remarks>
     /// 目标格式：<br/>
@@ -74,8 +74,9 @@ namespace WeiboAlbumDownloader.Helpers
     ///    GCamera:MicroVideoOffset 与 Container:Directory/Item:Length 均取「尾部内嵌微视频的字节长度」，
     ///    解析器按 视频起点 = 文件总长 − offset 反推（已验证可播放的 QQ / OPPO 参考文件如此取值）；<br/>
     /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
-    /// 内嵌 MP4 仅修正 ftyp 品牌（qt→isom，兼容品牌 qt→mp42），不裁剪 iPhone 专有扩展盒、不重建时序表，
-    /// 依赖解析器兼容性；如需更强容器正确性，可另行集成 FFmpeg。
+    /// 内嵌 MP4 首选经过 FFmpeg remux（剔除 iPhone 专有的 mebx 音轨，moov faststart 前置，音频重编码为 AAC），
+    /// 以满足 OPPO 等严格解析器对「标准干净 MP4 容器」的校验；未随程序分发 ffmpeg 或 remux 失败时，
+    /// 回退为仅修正 ftyp 品牌（qt→isom，兼容品牌 qt→mp42）的换标产物（宽松端仍可识别，OPPO 可能不识别）。
     /// </remarks>
     public static class MotionPhotoHelper
     {
@@ -429,15 +430,31 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ⑤ MOV → MP4 换标 ───────────────────────────
 
         /// <summary>
-        /// 将 QuickTime MOV 改写为标准 MP4 容器：仅修正 ftyp 品牌字节（qt→isom，兼容品牌 qt→mp42），
-        /// 供完整播放器识别。不做脆弱的 moov 字节手术，避免产出结构自洽性更差的半成品。
-        /// 本实现不依赖 FFmpeg。
+        /// 将 QuickTime MOV 改写为标准 MP4 容器。
+        /// 首选 FFmpeg remux（<see cref="FfmpegInvoker.RemuxToMp4"/>）：剔除 iPhone 专用 mebx 轨、
+        /// moov faststart 前置、音频重编码 AAC，产出严格解析器（OPPO 等）认可的干净标准 MP4。
+        /// 未随程序分发 ffmpeg 或 remux 失败时，回退为仅修正 ftyp 品牌字节（qt→isom，兼容品牌 qt→mp42），
+        /// 保证宽松端（Windows Photos 等）仍能识别。
         /// </summary>
         /// <param name="movPath">源 MOV 路径</param>
         /// <param name="outPath">输出 MP4 路径（通常为临时文件）</param>
         /// <returns>输出文件完整路径</returns>
         public static string RelabelMovToMp4(string movPath, string outPath)
         {
+            try
+            {
+                // 首选：FFmpeg remux（存在且成功时产出高质量标准 MP4）
+                return FfmpegInvoker.RemuxToMp4(movPath, outPath);
+            }
+            catch (FileNotFoundException)
+            {
+                // 未随程序分发 ffmpeg(.exe)：回退纯 ftyp 换标
+            }
+            catch (InvalidDataException)
+            {
+                // ffmpeg 存在但 remux 失败：回退纯 ftyp 换标，保证产物仍可被宽松端识别
+            }
+
             var bytes = File.ReadAllBytes(movPath);
             var header = PatchFtypBrand(bytes, Math.Min(bytes.Length, 64));
             Buffer.BlockCopy(header, 0, bytes, 0, header.Length);
@@ -690,7 +707,7 @@ namespace WeiboAlbumDownloader.Helpers
             string? tempMerged = null;
             try
             {
-                // ① MOV → MP4 换标（修饰 ftyp 品牌字节，无需 FFmpeg）
+                // ① MOV → 标准 MP4：FFmpeg remux（剔 mebx、faststart、音频 AAC）优选，缺失/失败回退纯 ftyp 换标
                 tempRelabel = Path.Combine(tempDir, $"{Guid.NewGuid():N}.mp4");
                 RelabelMovToMp4(mov, tempRelabel);
 
