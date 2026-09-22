@@ -79,19 +79,6 @@ jobs:
     - name: Build
       run: dotnet build "${{ env.Solution_Name }}" --configuration "${{ env.Configuration }}" --no-restore
 
-    # 下载静态 FFmpeg 并随程序一起分发（动态照片合成的视频容器重建依赖它）
-    - name: Download FFmpeg
-      shell: powershell
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
-        $out = Join-Path $env:RUNNER_TEMP 'ffmpeg'
-        Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
-        Expand-Archive -Path $zip -DestinationPath $out -Force
-        $exe = Get-ChildItem -Path $out -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-        if (-not $exe) { throw '未在 FFmpeg 压缩包中找到 ffmpeg.exe' }
-        Copy-Item $exe.FullName "WeiboAlbumDownloader\bin\Release\net6.0-windows\ffmpeg.exe" -Force
-
     # 上传构建产物
     - name: Upload bin directory
       uses: actions/upload-artifact@v4
