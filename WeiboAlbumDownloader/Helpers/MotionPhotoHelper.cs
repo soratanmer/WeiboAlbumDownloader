@@ -69,8 +69,9 @@ namespace WeiboAlbumDownloader.Helpers
     /// <remarks>
     /// 目标格式：<br/>
     /// 1. 物理结构 = 标准 JPEG 封面（前段）+ 尾部二进制拼接的 MP4 微视频；<br/>
-    /// 2. 在 JPEG 头部注入「并集」XMP（legacy MicroVideo + Google 容器 MotionPhoto，
-    ///    同时满足 Windows Photos / 小米 / OPPO / 谷歌 的识别要求）。<br/>
+    /// 2. 在 JPEG 头部注入「纯净 Google 容器」XMP（GCamera:MotionPhoto + Container:Directory/Item:Length，
+    ///    同时满足 OPPO / 谷歌 / Windows Photos / 小米 的识别要求；刻意不写 legacy MicroVideo 字段，
+    ///    因为 OPPO 等严格解析器会因 legacy 字段拒识）。<br/>
     ///    GCamera:MicroVideoOffset 与 Container:Directory/Item:Length 均取「尾部内嵌微视频的字节长度」，
     ///    解析器按 视频起点 = 文件总长 − offset 反推（已验证可播放的 QQ / OPPO 参考文件如此取值）；<br/>
     /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
@@ -318,11 +319,13 @@ namespace WeiboAlbumDownloader.Helpers
         /// 构建 Google 动态照片 XMP 的完整字节（UTF-8）
         /// </summary>
         /// <remarks>
-        /// 输出「并集」元数据，一份同时满足多厂商识别：
-        /// 1. legacy 微电影：GCamera:MicroVideo / MicroVideoOffset（Windows Photos / 小米 / 旧解析器）；<br/>
-        /// 2. Google 容器格式：GCamera:MotionPhoto + Container:Directory / Item:Length（OPPO / 谷歌，符合
+        /// 输出「纯净 Google 容器」元数据，一份满足多厂商识别：
+        /// 1. Google 容器格式：GCamera:MotionPhoto + Container:Directory / Item:Length（OPPO / 谷歌，符合
         ///    Android Motion Photo 1.0 规范）；<br/>
-        /// 3. 厂商扩展命名空间 OpCamera（OPPO）/ MiCamera（小米），无副作用。
+        /// 2. 厂商扩展命名空间 OpCamera（OPPO）/ MiCamera（小米），无副作用。
+        /// 注意：刻意不写 legacy 微电影字段（GCamera:MicroVideo*）。真机实测（2026-09-22）OPPO 会因
+        /// legacy 字段拒识整个文件为动态照片（H 系列对照：含 legacy 全拒识、纯净容器全识别），
+        /// 故仅保留 Google 容器 XMP 以保证严格解析器兼容。
         /// 结构参考自 XHS_Downloader_Android 的 <c>LivePhotoCreator.generateXmpMetadata</c>。
         /// </remarks>
         /// <param name="videoLength">内嵌视频的字节长度（MicroVideoOffset 与 Item:Length 均取其值，语义=尾部视频长度）</param>
@@ -357,10 +360,6 @@ namespace WeiboAlbumDownloader.Helpers
       OpCamera:MotionPhotoOwner=""weibo""
       OpCamera:OLivePhotoVersion=""2""
       OpCamera:VideoLength=""{lenStr}""
-      GCamera:MicroVideoVersion=""1""
-      GCamera:MicroVideo=""1""
-      GCamera:MicroVideoOffset=""{lenStr}""
-      GCamera:MicroVideoPresentationTimestampUs=""0""
       MiCamera:XMPMeta=""&lt;?xml version='1.0' encoding='UTF-8' standalone='yes' ?&gt;"">
       <Container:Directory>
         <rdf:Seq>
@@ -383,7 +382,9 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ④ JPEG 注入 XMP（APP1） ───────────────────────────
 
         /// <summary>
-        /// 在 JPEG 的 SOI(FFD8) 之后插入一条 APP1(FFE1) XMP 段，其余字节原样保留
+        /// 在 JPEG 头部注入一条 APP1(FFE1) XMP 段：放在所有既有 APPn/COM 段（如 APP0/JFIF、APP1/EXIF）之后、
+        /// 首个量化/SOF 段之前，其余字节原样保留。
+        /// 这样产出「EXIF 前置、XMP 后置」的布局，与可被 OPPO 识别的参考结构一致（严格解析器要求 EXIF 先于 XMP）。
         /// </summary>
         /// <param name="jpgPath">源 JPEG 路径</param>
         /// <param name="xmpBytes">XMP 字节（不包含段头，也不包含前缀）</param>
@@ -409,11 +410,17 @@ namespace WeiboAlbumDownloader.Helpers
             }
             var segLen = (ushort)(2 + prefixBytes.Length + xmpBytes.Length);
 
+            // 定位首个非 APPn/COM 段（DQT/SOF/SOS…）的段首，XMP 插在其前
+            var boundary = FindXmpInsertOffset(src);
+
             using var dest = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, CopyBufferSize);
             // SOI
             dest.Write(src, 0, 2);
 
-            // APP1 段头
+            // 头部既有 APPn/COM 段原样（含 APP0/JFIF、APP1/EXIF）
+            dest.Write(src, 2, boundary - 2);
+
+            // XMP APP1 段（http xap 前缀）
             dest.WriteByte(0xFF);
             dest.WriteByte(0xE1);
             dest.WriteByte((byte)((segLen >> 8) & 0xFF));
@@ -421,10 +428,38 @@ namespace WeiboAlbumDownloader.Helpers
             dest.Write(prefixBytes, 0, prefixBytes.Length);
             dest.Write(xmpBytes, 0, xmpBytes.Length);
 
-            // 剩余 JPEG 原样
-            dest.Write(src, 2, src.Length - 2);
+            // 剩余（首个量化/SOF 段起，含熵编码与尾部视频）原样
+            dest.Write(src, boundary, src.Length - boundary);
 
             return outPath;
+        }
+
+        /// <summary>
+        /// 返回 JPEG 头部 APPn/COM 段序列结束、首个非 APPn/COM 段（DQT/SOF/SOS…）的段首偏移，
+        /// 用于在其前插入 XMP。找不到时回退到原注入位置 offset=2（紧随 SOI）。
+        /// </summary>
+        private static int FindXmpInsertOffset(byte[] src)
+        {
+            var n = src.Length;
+            var i = 2;
+            while (i < n && src[i] == 0xFF)
+            {
+                var segStart = i;
+                while (i < n && src[i] == 0xFF) i++;
+                if (i >= n) break;
+                var marker = src[i];
+                // 仅继续消费 APP0-APP15(0xE0-0xEF) 与 COM(0xFE)；其余（DQT/SOF/SOS…）即终端
+                var isAppOrCom = (marker >= 0xE0 && marker <= 0xEF) || marker == 0xFE;
+                if (!isAppOrCom)
+                {
+                    return segStart;
+                }
+                i++; // 越过标记字节，落到长度字段
+                if (i + 2 > n) break;
+                var len = (src[i] << 8) | src[i + 1];
+                i += 2 + len;
+            }
+            return 2;
         }
 
         // ─────────────────────────── ⑤ MOV → MP4 换标 ───────────────────────────
