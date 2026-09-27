@@ -457,7 +457,9 @@ namespace WeiboAlbumDownloader.Helpers
                 i++; // 越过标记字节，落到长度字段
                 if (i + 2 > n) break;
                 var len = (src[i] << 8) | src[i + 1];
-                i += 2 + len;
+                // JPEG 段长度字段包含「长度字段自身的 2 字节」，故跨段偏移为 len（i 已越过段头 marker，
+                // 落到长度字段首字节）；若误写 2+len 会每段多跳 2 字节导致定位错乱、回退到偏移 2。
+                i += len;
             }
             return 2;
         }
