@@ -58,13 +58,34 @@ namespace WeiboAlbumDownloader.Helpers
         /// </summary>
         /// <param name="srcPath">源视频路径（.mov / .mp4）</param>
         /// <param name="outPath">输出 MP4 路径（若存在将被覆盖）</param>
+        /// <param name="transposeDirection">>0 时表示将旋转烘焙进像素：用 <c>-noautorotate</c> 关闭 ffmpeg 自动旋转，
+        /// 再以显式 <c>transpose=值</c> 重编码，使输出像素变为竖屏、Rotation=0°（任何播放器均竖直显示，不受
+        /// 源文件中退化的显示矩阵影响）。值取 ffmpeg transpose 滤镜的 1..4。0 表示无需烘焙走常规 remux。</param>
         /// <returns>输出文件完整路径</returns>
         /// <exception cref="FileNotFoundException">未找到 ffmpeg(.exe)</exception>
         /// <exception cref="InvalidDataException">FFmpeg remux 失败</exception>
-        public static string RemuxToMp4(string srcPath, string outPath)
+        public static string RemuxToMp4(string srcPath, string outPath, int transposeDirection = 0)
         {
             var exe = LocateFfmpeg()
                 ?? throw new FileNotFoundException("未找到 ffmpeg(.exe)（应随程序一起分发，或加入系统 PATH）。");
+
+            // 旋转烘焙路径：竖拍照片的视频源可能带退化/非标准的显示矩阵（如 [0,1,1,0]，实为镜像而非旋转），不同播放器解读不一致，
+            // 导致部分端上播放被旋转 90°/270°。此处把源矩阵关掉（-noautorotate）并显式 transpose 重编码，
+            // 使输出像素为竖屏、Rotation=0°，彻底规避矩阵解读差异。烘焙失败则回退常规 remux（保持现状，不阻断合并）。
+            if (transposeDirection > 0)
+            {
+                var bake = new[]
+                {
+                    "-noautorotate", "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-vf", $"transpose={transposeDirection}",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outPath
+                };
+                if (RunAndSucceeded(exe, bake) && IsNonEmpty(outPath))
+                {
+                    return outPath;
+                }
+                File.Delete(outPath);
+            }
 
             // 第一优先：视频零转码 remux，仅音频重编码 AAC，moov 前置（faststart），剔除 mebx 数据轨。
             var first = new[] { "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outPath };

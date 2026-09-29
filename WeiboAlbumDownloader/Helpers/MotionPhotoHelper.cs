@@ -491,13 +491,15 @@ namespace WeiboAlbumDownloader.Helpers
         /// </summary>
         /// <param name="movPath">源 MOV 路径</param>
         /// <param name="outPath">输出 MP4 路径（通常为临时文件）</param>
+        /// <param name="transposeDirection">>0 时经 FFmpeg 把旋转烘焙进像素（竖屏 0°，见
+        /// <see cref="FfmpegInvoker.RemuxToMp4"/>）；0 表示常规 remux。</param>
         /// <returns>输出文件完整路径</returns>
-        public static string RelabelMovToMp4(string movPath, string outPath)
+        public static string RelabelMovToMp4(string movPath, string outPath, int transposeDirection = 0)
         {
             try
             {
                 // 首选：FFmpeg remux（存在且成功时产出高质量标准 MP4）
-                return FfmpegInvoker.RemuxToMp4(movPath, outPath);
+                return FfmpegInvoker.RemuxToMp4(movPath, outPath, transposeDirection);
             }
             catch (FileNotFoundException)
             {
@@ -760,9 +762,26 @@ namespace WeiboAlbumDownloader.Helpers
             string? tempMerged = null;
             try
             {
-                // ① MOV → 标准 MP4：FFmpeg remux（剔 mebx、faststart、音频 AAC）优选，缺失/失败回退纯 ftyp 换标
+                // ① MOV → 标准 MP4：FFmpeg remux（剔 mebx、faststart、音频 AAC）优选，缺失/失败回退纯 ftyp 换标。
+                //    竖拍照片的源视频可能带退化显示矩阵（不同播放器解读不一致，部分端播放旋转 90°/270°），
+                //    这里以封面方向为准：封面竖拍且视频像素为横屏时，把旋转烘焙进像素（输出竖屏 0°）。
+                //    要求严格横屏（vw>vh）：方形视频旋转后方向无意义，保持原样更安全。
+                //    transpose 方向常量需真机定乾坤（transpose=1 为当前选择，若成镜像改 2 即可一行切换）。
+                var transpose = 0;
+                if (TryGetJpegPortrait(jpg, out var coverIsPortrait) && coverIsPortrait &&
+                    TryGetVideoPixelSize(mov, out var vw, out var vh) && vw > vh)
+                {
+                    transpose = MotionTransposeDirection;
+                }
+
                 tempRelabel = Path.Combine(tempDir, $"{Guid.NewGuid():N}.mp4");
-                RelabelMovToMp4(mov, tempRelabel);
+                RelabelMovToMp4(mov, tempRelabel, transpose);
+
+                // 烘焙路径：显式清零显示矩阵，保证输出 Rotation=0°（不依赖 FFmpeg 版本的矩阵传递行为）
+                if (transpose > 0)
+                {
+                    ClearDisplayMatrix(tempRelabel);
+                }
 
                 // ② 构建并注入 GCamera XMP（presentationTimestamp 暂用 0 回退）
                 //    内嵌视频字节数 = 换标+重构后的 MP4 实际长度。
@@ -862,6 +881,258 @@ namespace WeiboAlbumDownloader.Helpers
         }
 
         // ─────────────────────────── 工具方法 ───────────────────────────
+
+        /// <summary>竖拍视频烘焙方向的 FFmpeg transpose 值。真机定镜像：transpose=1（顺时针90°）为当前选择；
+        /// 若产物同方向可见内容被镜像，改 2（逆时针90°）即可顺势切换。</summary>
+        private const int MotionTransposeDirection = 1;
+
+        /// <summary>
+        /// 读取 JPEG 封面 SOF（Start Of Frame）实际像素方向，判断是否竖拍（高&gt;宽）。
+        /// 微博封面大多不含 EXIF Orientation，SOF 宽高即展示方向，故以此对齐最终封面显示。
+        /// 返回 false 表示无法判断（读不到 SOF）。
+        /// </summary>
+        private static bool TryGetJpegPortrait(string jpgPath, out bool portrait)
+        {
+            portrait = false;
+            try
+            {
+                var src = File.ReadAllBytes(jpgPath);
+                if (src.Length < 4 || src[0] != 0xFF || src[1] != 0xD8)
+                {
+                    return false;
+                }
+
+                var i = 2;
+                while (i + 4 <= src.Length)
+                {
+                    if (src[i] != 0xFF) { i++; continue; }
+                    var marker = src[i + 1];
+
+                    // SOF0/SOF2：宽高位于标记之后的 5 字节（长度2 + 精度1 + 高2 + 宽2）
+                    if (marker == 0xC0 || marker == 0xC2)
+                    {
+                        if (i + 9 < src.Length)
+                        {
+                            var h = (src[i + 5] << 8) | src[i + 6];
+                            var w = (src[i + 7] << 8) | src[i + 8];
+                            portrait = h > w;
+                            return true;
+                        }
+                        return false;
+                    }
+
+                    // RST 段（D0-D7）无长度；SOI(0xD8)/TEM(0x01) 单字节；EOI(0xD9) 结束
+                    if (marker >= 0xD0 && marker <= 0xD7) { i += 2; continue; }
+                    if (marker == 0xD8 || marker == 0x01) { i += 2; continue; }
+                    if (marker == 0xD9) { break; }
+
+                    var len = (src[i + 2] << 8) | src[i + 3];
+                    i += 2 + len;
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 读取 video 文件（.mov/.mp4）内视频轨 stsd 的实际像素尺寸。
+        /// 用于判断源视频是否为横/竖屏，从而决定是否烘焙旋转。
+        /// </summary>
+        private static bool TryGetVideoPixelSize(string videoPath, out int width, out int height)
+        {
+            width = height = 0;
+            try
+            {
+                using var fs = new FileStream(videoPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                // 源 MOV 通常为若干 MB，完整装入后按 box 树定位 stsd（moov 可能在前或后）
+                using var ms = new MemoryStream();
+                fs.CopyTo(ms);
+                var data = ms.GetBuffer();
+                var length = (int)ms.Length;
+
+                // 递归解析 box 树，捕获所有 stsd 下的视频样本条目尺寸（lambda 内不能直接写 out 参数，用局部变量中转）
+                var found = false;
+                var localW = 0;
+                var localH = 0;
+                WalkBoxes(data, 0, length, (pos, size) =>
+                {
+                    // pos 为样本条目起始（size 字段）。VisualSampleEntry：格式@+4，宽@+32 高@+34
+                    var format = ReadFourCc(data, pos + 4);
+                    var isVideo = format == "avc1" || format == "avc3" || format == "hvc1" || format == "hev1";
+                    if (isVideo && size >= 36)
+                    {
+                        localW = (data[pos + 32] << 8) | data[pos + 33];
+                        localH = (data[pos + 34] << 8) | data[pos + 35];
+                        found = true;
+                    }
+                });
+
+                width = localW;
+                height = localH;
+                return found && width > 0 && height > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>读取 4 字节 box 类型/样本格式标识</summary>
+        private static string ReadFourCc(byte[] data, int offset)
+            => offset + 4 <= data.Length
+                ? Encoding.ASCII.GetString(data, offset, 4)
+                : string.Empty;
+
+        /// <summary>递归遍历 MP4 box 树，命中视频样本条目（avc1 等）后回调；大端序解析</summary>
+        private static void WalkBoxes(byte[] data, int start, int end, Action<int, int> onSampleEntry, int depth = 0)
+        {
+            if (depth > 14) return; // 防畸形文件深层递归失控
+            var pos = start;
+            while (pos + 8 <= end)
+            {
+                var boxSize = Be32(data, pos);
+                var boxType = Encoding.ASCII.GetString(data, pos + 4, 4);
+                var header = 8;
+                if (boxSize == 1)
+                {
+                    if (pos + 16 > end) break;
+                    boxSize = (int)Be64(data, pos + 8); // 64 位扩展箱，仅按低 32 位近似
+                    header = 16;
+                }
+                else if (boxSize == 0)
+                {
+                    boxSize = end - pos; // 箱延至文件末尾
+                }
+
+                if (boxSize < header || pos + boxSize > end) break;
+
+                if (boxType == "stsd")
+                {
+                    // stsd 为 FullBox：版本+标识(4) + 条目数(4)，后续为各样本条目（含视频 SampleEntry）。
+                    // 注意不能在此 return——音频轨的 stsd（mp4a）通常先于视频轨出现，需继续遍历后续 trak。
+                    ParseSampleEntries(data, pos + header, pos + boxSize, onSampleEntry);
+                }
+                else
+                {
+                    // meta 亦为 FullBox，其子箱起点需再跳过版本+标识(4)，否则子箱会被误读
+                    var childStart = boxType == "meta" ? pos + header + 4 : pos + header;
+                    WalkBoxes(data, childStart, pos + boxSize, onSampleEntry, depth + 1);
+                }
+
+                pos += boxSize;
+            }
+        }
+
+        /// <summary>解析 stsd 内容中的样本条目列表，命中视频条目（宽高处）回调</summary>
+        private static void ParseSampleEntries(byte[] data, int stsdContentStart, int stsdEnd, Action<int, int> onSampleEntry)
+        {
+            // stsdContentStart 指向 FullBox 的版本+标识：+4 为条目数，+8 起为各样本条目
+            var entryCount = Be32(data, stsdContentStart + 4);
+            var ep = stsdContentStart + 8;
+            for (var e = 0; e < entryCount && ep + 8 <= stsdEnd; e++)
+            {
+                var entrySize = Be32(data, ep);
+                if (entrySize < 8 || ep + entrySize > stsdEnd) break;
+                onSampleEntry(ep, entrySize);
+                ep += entrySize;
+            }
+        }
+
+        /// <summary>大端读取 32 位无符号整数</summary>
+        private static int Be32(byte[] d, int o) => o + 4 <= d.Length
+            ? (d[o] << 24) | (d[o + 1] << 16) | (d[o + 2] << 8) | d[o + 3] : 0;
+
+        /// <summary>大端读取 64 位无符号整数（低 32 位近似）</summary>
+        private static long Be64(byte[] d, int o) => o + 8 <= d.Length
+            ? ((long)d[o] << 56) | ((long)d[o + 1] << 48) | ((long)d[o + 2] << 40) | ((long)d[o + 3] << 32)
+              | ((long)d[o + 4] << 24) | ((long)d[o + 5] << 16) | ((long)d[o + 6] << 8) | d[o + 7] : 0;
+
+        /// <summary>大端写入 32 位整数</summary>
+        private static void WriteBe32(byte[] d, int o, int v)
+        {
+            d[o] = (byte)(v >> 24);
+            d[o + 1] = (byte)(v >> 16);
+            d[o + 2] = (byte)(v >> 8);
+            d[o + 3] = (byte)v;
+        }
+
+        /// <summary>递归查找指定类型的 box，命中回调 (boxStart, boxSize)</summary>
+        private static void FindBoxes(byte[] data, int start, int end, string boxType, Action<int, int> onFound, int depth = 0)
+        {
+            if (depth > 14) return;
+            var pos = start;
+            while (pos + 8 <= end)
+            {
+                var size = Be32(data, pos);
+                var type = Encoding.ASCII.GetString(data, pos + 4, 4);
+                var header = 8;
+                if (size == 1)
+                {
+                    if (pos + 16 > end) break;
+                    size = (int)Be64(data, pos + 8);
+                    header = 16;
+                }
+                else if (size == 0)
+                {
+                    size = end - pos;
+                }
+
+                if (size < header || pos + size > end) break;
+
+                if (type == boxType) onFound(pos, size);
+
+                // mdat 为媒体数据，非容器，不下沉；meta 为 FullBox，子箱起点需再跳 4 字节
+                if (type != "mdat")
+                {
+                    var childStart = type == "meta" ? pos + header + 4 : pos + header;
+                    FindBoxes(data, childStart, pos + size, boxType, onFound, depth + 1);
+                }
+
+                pos += size;
+            }
+        }
+
+        /// <summary>
+        /// 将 MP4 内视频轨 tkhd 的显示矩阵重置为单位阵（Rotation 0°）。
+        /// 转码路径下 FFmpeg 是否保留源显示矩阵随版本而异，这里显式清零，
+        /// 确保烘焙后的产物对任何播放器都无旋转，彻底规避退化矩阵的解读差异。
+        /// </summary>
+        private static void ClearDisplayMatrix(string mp4Path)
+        {
+            var data = File.ReadAllBytes(mp4Path);
+            var changed = false;
+
+            FindBoxes(data, 0, data.Length, "tkhd", (pos, size) =>
+            {
+                // tkhd 尾部 8 字节为宽/高（16.16 定点）；视频轨宽高非零，音频轨为 0
+                if (size < 16 || Be32(data, pos + size - 8) <= 0) return;
+
+                // 矩阵位于 FullBox 头之后：v0 偏移 +48，v1（64 位时间戳）偏移 +60
+                var version = data[pos + 8];
+                var matrixOffset = pos + (version == 1 ? 60 : 48);
+                if (matrixOffset + 36 > pos + size) return;
+
+                WriteBe32(data, matrixOffset, 0x00010000);     // a
+                WriteBe32(data, matrixOffset + 4, 0);          // b
+                WriteBe32(data, matrixOffset + 8, 0);          // u
+                WriteBe32(data, matrixOffset + 12, 0);         // c
+                WriteBe32(data, matrixOffset + 16, 0x00010000); // d
+                WriteBe32(data, matrixOffset + 20, 0);         // v
+                WriteBe32(data, matrixOffset + 24, 0);         // x
+                WriteBe32(data, matrixOffset + 28, 0);         // y
+                WriteBe32(data, matrixOffset + 32, 0x40000000); // w
+                changed = true;
+            });
+
+            if (changed)
+            {
+                File.WriteAllBytes(mp4Path, data);
+            }
+        }
 
         /// <summary>判断是否为 jpg/jpeg 文件</summary>
         private static bool IsJpg(string path)
