@@ -382,9 +382,12 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ④ JPEG 注入 XMP（APP1） ───────────────────────────
 
         /// <summary>
-        /// 在 JPEG 头部注入一条 APP1(FFE1) XMP 段：放在所有既有 APPn/COM 段（如 APP0/JFIF、APP1/EXIF）之后、
-        /// 首个量化/SOF 段之前，其余字节原样保留。
-        /// 这样产出「EXIF 前置、XMP 后置」的布局，与可被 OPPO 识别的参考结构一致（严格解析器要求 EXIF 先于 XMP）。
+        /// 在 JPEG 头部注入一条 APP1(FFE1) XMP 段，其余字节原样保留。
+        /// 注入点 = 首个既有 APP1 段（通常是 EXIF）之前，使 XMP 成为 JPEG 的第一个 APP1：
+        /// 产出「JFIF → XMP → EXIF → …」布局。飞牛(fnOS)只读取首个 APP1 中的 MotionPhoto XMP，
+        /// 若 XMP 落在 EXIF 之后（第 2 个 APP1）会被当成普通照片；而 OPPO 等严格解析器对
+        /// EXIF 段序不敏感（唯一 blocker 是 legacy MicroVideo 字段，BuildGPhotoXmp 已剔除），故不受影响。
+        /// 源封面无任何 APP1 时沿用「所有 APPn 段之后、SOF 之前」的原注入点（XMP 自动成为首个 APP1）。
         /// </summary>
         /// <param name="jpgPath">源 JPEG 路径</param>
         /// <param name="xmpBytes">XMP 字节（不包含段头，也不包含前缀）</param>
@@ -410,17 +413,19 @@ namespace WeiboAlbumDownloader.Helpers
             }
             var segLen = (ushort)(2 + prefixBytes.Length + xmpBytes.Length);
 
-            // 定位首个非 APPn/COM 段（DQT/SOF/SOS…）的段首，XMP 插在其前
-            var boundary = FindXmpInsertOffset(src);
+            // 注入点：优先「首个 APP1 段首」（使 XMP 成为首个 APP1，供 fnOS 识别）；
+            // 源无 APP1 时回退到「首个非 APPn/COM 段首」（DQT/SOF/SOS 之前，XMP 自动为首个 APP1）。
+            var firstApp1 = FindFirstApp1Offset(src);
+            var boundary = firstApp1 >= 0 ? firstApp1 : FindXmpInsertOffset(src);
 
             using var dest = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, CopyBufferSize);
             // SOI
             dest.Write(src, 0, 2);
 
-            // 头部既有 APPn/COM 段原样（含 APP0/JFIF、APP1/EXIF）
+            // 头部既有段中位于注入点之前的原样保留（通常含 APP0/JFIF；有 APP1 时不含首个 APP1/EXIF）
             dest.Write(src, 2, boundary - 2);
 
-            // XMP APP1 段（http xap 前缀）
+            // XMP APP1 段（http xap 前缀）：注入点为「首个 APP1 段首」，故 XMP 成为首个 APP1
             dest.WriteByte(0xFF);
             dest.WriteByte(0xE1);
             dest.WriteByte((byte)((segLen >> 8) & 0xFF));
@@ -428,7 +433,7 @@ namespace WeiboAlbumDownloader.Helpers
             dest.Write(prefixBytes, 0, prefixBytes.Length);
             dest.Write(xmpBytes, 0, xmpBytes.Length);
 
-            // 剩余（首个量化/SOF 段起，含熵编码与尾部视频）原样
+            // 剩余（自首个 APP1/或 SOF 起，含原 EXIF 等段、熵编码与尾部视频）原样
             dest.Write(src, boundary, src.Length - boundary);
 
             return outPath;
@@ -462,6 +467,38 @@ namespace WeiboAlbumDownloader.Helpers
                 i += len;
             }
             return 2;
+        }
+
+        /// <summary>
+        /// 返回 JPEG 头部第一个 APP1(0xE1) 段的段首偏移；头部只有 APP0/COM 而无任何 APP1（或已到
+        /// SOF/SOS 等非 APPn、COM 段）时返回 -1。用于把 XMP 注入到 EXIF 之前、使其成为首个 APP1。
+        /// </summary>
+        private static int FindFirstApp1Offset(byte[] src)
+        {
+            var n = src.Length;
+            var i = 2;
+            while (i < n && src[i] == 0xFF)
+            {
+                var segStart = i;
+                while (i < n && src[i] == 0xFF) i++;
+                if (i >= n) break;
+                var marker = src[i];
+                if (marker == 0xE1)
+                {
+                    return segStart; // 首个 APP1 段首
+                }
+
+                var isAppOrCom = (marker >= 0xE0 && marker <= 0xEF) || marker == 0xFE;
+                if (!isAppOrCom)
+                {
+                    return -1; // 遇到 SOF/DQT/SOS… 仍无 APP1
+                }
+                i++; // 越过标记字节，落到长度字段
+                if (i + 2 > n) break;
+                var len = (src[i] << 8) | src[i + 1];
+                i += len;
+            }
+            return -1;
         }
 
         // ─────────────────────────── ⑤ MOV → MP4 换标 ───────────────────────────
