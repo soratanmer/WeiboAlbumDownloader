@@ -382,12 +382,15 @@ namespace WeiboAlbumDownloader.Helpers
         // ─────────────────────────── ④ JPEG 注入 XMP（APP1） ───────────────────────────
 
         /// <summary>
-        /// 在 JPEG 头部注入一条 APP1(FFE1) XMP 段，其余字节原样保留。
-        /// 注入点 = 首个既有 APP1 段（通常是 EXIF）之前，使 XMP 成为 JPEG 的第一个 APP1：
-        /// 产出「JFIF → XMP → EXIF → …」布局。飞牛(fnOS)只读取首个 APP1 中的 MotionPhoto XMP，
-        /// 若 XMP 落在 EXIF 之后（第 2 个 APP1）会被当成普通照片；而 OPPO 等严格解析器对
-        /// EXIF 段序不敏感（唯一 blocker 是 legacy MicroVideo 字段，BuildGPhotoXmp 已剔除），故不受影响。
-        /// 源封面无任何 APP1 时沿用「所有 APPn 段之后、SOF 之前」的原注入点（XMP 自动成为首个 APP1）。
+        /// 在 JPEG 头部注入一条 APP1(FFE1) XMP 段，并重建头部以满足跨端识别：
+        /// 1. 保留源 APP0/JFIF、APP2…APP15、COM 等段，按原序写出；<br/>
+        /// 2. 剔除源所有 APP1 段——既剔除 EXIF，也剔除源既有 XMP。飞牛(fnOS) 真机复测确认：
+        ///    判别点是「封面 JPEG 是否含 EXIF」——源封面无 EXIF 的帖子整批可识别，带 EXIF@24 的全被当
+        ///    成普通照片；与 XMP 段序、音轨有无、分辨率均无关。故必须剥离 EXIF 才能让飞牛识别；<br/>
+        /// 3. 把本 XMP 作为唯一的首个 APP1 插到首个非 APPn/COM 段（DQT/SOF…）之前，
+        ///    产出「JFIF → XMP → DQT…」布局，与飞牛已识别的样例结构完全同构。<br/>
+        /// OPPO / QQ / Windows Photos 对封面是否含 EXIF、EXIF 段序均不敏感（唯一 blocker 是
+        /// legacy MicroVideo 字段，BuildGPhotoXmp 已剔除），故剥离 EXIF 不损其兼容性。
         /// </summary>
         /// <param name="jpgPath">源 JPEG 路径</param>
         /// <param name="xmpBytes">XMP 字节（不包含段头，也不包含前缀）</param>
@@ -413,92 +416,68 @@ namespace WeiboAlbumDownloader.Helpers
             }
             var segLen = (ushort)(2 + prefixBytes.Length + xmpBytes.Length);
 
-            // 注入点：优先「首个 APP1 段首」（使 XMP 成为首个 APP1，供 fnOS 识别）；
-            // 源无 APP1 时回退到「首个非 APPn/COM 段首」（DQT/SOF/SOS 之前，XMP 自动为首个 APP1）。
-            var firstApp1 = FindFirstApp1Offset(src);
-            var boundary = firstApp1 >= 0 ? firstApp1 : FindXmpInsertOffset(src);
+            using (var dest = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, CopyBufferSize))
+            {
+                // SOI
+                dest.Write(src, 0, 2);
 
-            using var dest = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, CopyBufferSize);
-            // SOI
-            dest.Write(src, 0, 2);
+                // 逐段重建头部。段起点 = 首个 0xFF（可能带多个填充 0xFF）。
+                var i = 2;
+                while (i < src.Length && src[i] == 0xFF)
+                {
+                    var segStart = i;
+                    while (i < src.Length && src[i] == 0xFF) i++; // 越过填充 0xFF 到标记字节
+                    if (i >= src.Length) break;
+                    var marker = src[i];
 
-            // 头部既有段中位于注入点之前的原样保留（通常含 APP0/JFIF；有 APP1 时不含首个 APP1/EXIF）
-            dest.Write(src, 2, boundary - 2);
+                    // 首个非 APPn/COM 段（DQT/SOF/DHT/SOS/EOI…）即头部结束：
+                    // 在此插入 XMP，其后（含该段与熵编码/尾部视频）原样完整复制。
+                    if (!IsAppOrCom(marker))
+                    {
+                        WriteXmpSegment(dest, prefixBytes, xmpBytes, segLen);
+                        dest.Write(src, segStart, src.Length - segStart);
+                        return outPath;
+                    }
 
-            // XMP APP1 段（http xap 前缀）：注入点为「首个 APP1 段首」，故 XMP 成为首个 APP1
+                    // APP0/APP2…/COM/APP1：读取段长度（长度字段含其自身 2 字节）
+                    i++; // 越过标记字节，落到长度字段
+                    if (i + 1 >= src.Length) break; // 畸形段，头部异常，回退到末尾补插
+                    var len = (src[i] << 8) | src[i + 1];
+                    var segEnd = i + len; // i 已在长度字段首，段末即 i + len（跳过度身）
+                    var segLenBytes = segEnd - segStart;
+
+                    // 剔除 APP1（EXIF 与源既有 XMP 均在内），保证本 XMP 是首个（唯一）APP1；
+                    // 其余 APP0/APP2…/COM 原样保留。
+                    var isApp1 = marker == 0xE1;
+                    if (!isApp1)
+                    {
+                        dest.Write(src, segStart, segLenBytes);
+                    }
+
+                    i = segEnd;
+                    if (i >= src.Length) break;
+                }
+
+                // 源头部不含任何非 APPn/COM 段（罕见/畸形）：在文件尾部补插 XMP
+                WriteXmpSegment(dest, prefixBytes, xmpBytes, segLen);
+            }
+
+            return outPath;
+        }
+
+        /// <summary>判断标记是否为 APPn(0xE0-0xEF) 或 COM(0xFE) 段；其余 DQT/SOF/DHT/SOS/EOI… 均视为头部结束</summary>
+        private static bool IsAppOrCom(int marker)
+            => (marker >= 0xE0 && marker <= 0xEF) || marker == 0xFE;
+
+        /// <summary>写出一条完整 APP1 XMP 段（FFE1 + 段长 + 前缀 + XMP）</summary>
+        private static void WriteXmpSegment(Stream dest, byte[] prefixBytes, byte[] xmpBytes, ushort segLen)
+        {
             dest.WriteByte(0xFF);
             dest.WriteByte(0xE1);
             dest.WriteByte((byte)((segLen >> 8) & 0xFF));
             dest.WriteByte((byte)(segLen & 0xFF));
             dest.Write(prefixBytes, 0, prefixBytes.Length);
             dest.Write(xmpBytes, 0, xmpBytes.Length);
-
-            // 剩余（自首个 APP1/或 SOF 起，含原 EXIF 等段、熵编码与尾部视频）原样
-            dest.Write(src, boundary, src.Length - boundary);
-
-            return outPath;
-        }
-
-        /// <summary>
-        /// 返回 JPEG 头部 APPn/COM 段序列结束、首个非 APPn/COM 段（DQT/SOF/SOS…）的段首偏移，
-        /// 用于在其前插入 XMP。找不到时回退到原注入位置 offset=2（紧随 SOI）。
-        /// </summary>
-        private static int FindXmpInsertOffset(byte[] src)
-        {
-            var n = src.Length;
-            var i = 2;
-            while (i < n && src[i] == 0xFF)
-            {
-                var segStart = i;
-                while (i < n && src[i] == 0xFF) i++;
-                if (i >= n) break;
-                var marker = src[i];
-                // 仅继续消费 APP0-APP15(0xE0-0xEF) 与 COM(0xFE)；其余（DQT/SOF/SOS…）即终端
-                var isAppOrCom = (marker >= 0xE0 && marker <= 0xEF) || marker == 0xFE;
-                if (!isAppOrCom)
-                {
-                    return segStart;
-                }
-                i++; // 越过标记字节，落到长度字段
-                if (i + 2 > n) break;
-                var len = (src[i] << 8) | src[i + 1];
-                // JPEG 段长度字段包含「长度字段自身的 2 字节」，故跨段偏移为 len（i 已越过段头 marker，
-                // 落到长度字段首字节）；若误写 2+len 会每段多跳 2 字节导致定位错乱、回退到偏移 2。
-                i += len;
-            }
-            return 2;
-        }
-
-        /// <summary>
-        /// 返回 JPEG 头部第一个 APP1(0xE1) 段的段首偏移；头部只有 APP0/COM 而无任何 APP1（或已到
-        /// SOF/SOS 等非 APPn、COM 段）时返回 -1。用于把 XMP 注入到 EXIF 之前、使其成为首个 APP1。
-        /// </summary>
-        private static int FindFirstApp1Offset(byte[] src)
-        {
-            var n = src.Length;
-            var i = 2;
-            while (i < n && src[i] == 0xFF)
-            {
-                var segStart = i;
-                while (i < n && src[i] == 0xFF) i++;
-                if (i >= n) break;
-                var marker = src[i];
-                if (marker == 0xE1)
-                {
-                    return segStart; // 首个 APP1 段首
-                }
-
-                var isAppOrCom = (marker >= 0xE0 && marker <= 0xEF) || marker == 0xFE;
-                if (!isAppOrCom)
-                {
-                    return -1; // 遇到 SOF/DQT/SOS… 仍无 APP1
-                }
-                i++; // 越过标记字节，落到长度字段
-                if (i + 2 > n) break;
-                var len = (src[i] << 8) | src[i + 1];
-                i += len;
-            }
-            return -1;
         }
 
         // ─────────────────────────── ⑤ MOV → MP4 换标 ───────────────────────────
