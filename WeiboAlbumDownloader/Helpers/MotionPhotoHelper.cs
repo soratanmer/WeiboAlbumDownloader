@@ -491,15 +491,15 @@ namespace WeiboAlbumDownloader.Helpers
         /// </summary>
         /// <param name="movPath">源 MOV 路径</param>
         /// <param name="outPath">输出 MP4 路径（通常为临时文件）</param>
-        /// <param name="transposeDirection">非 null 时经 FFmpeg 把旋转烘焙进像素（展示方向 0°，见
+        /// <param name="bake">非 null 时经 FFmpeg 把旋转烘焙进像素（展示方向 0°，见
         /// <see cref="FfmpegInvoker.RemuxToMp4"/>）；null 表示常规 remux。</param>
         /// <returns>输出文件完整路径</returns>
-        public static string RelabelMovToMp4(string movPath, string outPath, int? transposeDirection = null)
+        public static string RelabelMovToMp4(string movPath, string outPath, VideoOrientation? bake = null)
         {
             try
             {
                 // 首选：FFmpeg remux（存在且成功时产出高质量标准 MP4）
-                return FfmpegInvoker.RemuxToMp4(movPath, outPath, transposeDirection);
+                return FfmpegInvoker.RemuxToMp4(movPath, outPath, bake);
             }
             catch (FileNotFoundException)
             {
@@ -766,20 +766,21 @@ namespace WeiboAlbumDownloader.Helpers
                 //    竖拍照片的源视频可能带退化/非标准的显示矩阵（如 [0,1,1,0]，实为镜像而非旋转），
                 //    不同播放器解读不一致，部分端播放被旋转 90°/270°。
                 //    这里以封面方向为准（封面竖拍 + 视频严格横屏；方形视频旋转无意义，保持原样更安全），
-                //    方向则由源显示矩阵决定——矩阵才是根因，固定常量无法同时满足合法 90° 阵与退化阵。
-                int? transpose = null;
+                //    方向则由源显示矩阵的逆决定——矩阵才是根因，固定常量无法同时满足合法阵与退化阵；
+                //    退化阵（det=−1）是反射而非旋转，其逆仍是反射，故表现为「先把 Rotation 归零，再水平镜像」。
+                VideoOrientation? bake = null;
                 if (TryGetJpegPortrait(jpg, out var coverIsPortrait) && coverIsPortrait &&
                     TryGetVideoPixelSize(mov, out var vw, out var vh) && vw > vh &&
                     TryGetVideoDisplayMatrix(mov, out var ma, out var mb, out var mc, out var md))
                 {
-                    transpose = TransposeFromMatrix(ma, mb, mc, md);
+                    bake = OrientationFromMatrix(ma, mb, mc, md);
                 }
 
                 tempRelabel = Path.Combine(tempDir, $"{Guid.NewGuid():N}.mp4");
-                RelabelMovToMp4(mov, tempRelabel, transpose);
+                RelabelMovToMp4(mov, tempRelabel, bake);
 
                 // 烘焙路径：显式清零显示矩阵，保证输出 Rotation=0°（不依赖 FFmpeg 版本的矩阵传递行为）
-                if (transpose.HasValue)
+                if (bake.HasValue)
                 {
                     ClearDisplayMatrix(tempRelabel);
                 }
@@ -930,14 +931,16 @@ namespace WeiboAlbumDownloader.Helpers
         }
 
         /// <summary>
-        /// 由源显示矩阵推出 FFmpeg transpose 方向。
-        /// MP4 显示矩阵（y 轴向下）与 FFmpeg transpose 滤镜（视觉旋转）之间相差一次竖直翻转，
-        /// 故按共轭 V∘M∘V 换算，即 [a,b,c,d] → [[a,−b],[−c,d]]：
-        /// <c>[0,1,−1,0]</c>(90°)→1、<c>[0,1,1,0]</c>(退化/转置)→3、<c>[0,−1,1,0]</c>(270°)→2、<c>[0,−1,−1,0]</c>(退化/反对角)→0。
+        /// 由源显示矩阵推出烘焙方向。
+        /// 实测表明播放器按矩阵的<b>逆</b>呈现（锚点：合法 90° 阵 <c>[0,1,−1,0]</c> 用 <c>transpose=1</c> 恰好正确，
+        /// 而 <c>transpose=1</c> 即该阵的逆），故烘焙方向取 M⁻¹：
+        /// 纯旋转阵（det=+1）的逆仍是旋转，直接用对应 transpose；
+        /// 反射阵（det=−1，即"退化阵"）的逆仍是反射，须在转置后追加一次水平镜像——即「先把 Rotation 归零，再水平镜像」。
+        /// <c>[0,1,−1,0]</c>→transpose=1、<c>[0,1,1,0]</c>→transpose=1+hflip、<c>[0,−1,1,0]</c>→transpose=2、<c>[0,−1,−1,0]</c>→transpose=3。
         /// 仅处理四分之一转矩阵（a=d=0 且 b,c 为 ±1.0）；单位阵/180° 等无法用 transpose 表达，返回 null 不烘焙。
         /// </summary>
-        /// <returns>FFmpeg transpose 值 0..3；无需/无法烘焙时返回 null</returns>
-        private static int? TransposeFromMatrix(int a, int b, int c, int d)
+        /// <returns>烘焙参数；无需/无法烘焙时返回 null</returns>
+        private static VideoOrientation? OrientationFromMatrix(int a, int b, int c, int d)
         {
             const int One = 0x10000; // 16.16 定点中的 1.0
             if (a != 0 || d != 0)
@@ -945,10 +948,10 @@ namespace WeiboAlbumDownloader.Helpers
                 return null;
             }
 
-            if (b == One && c == -One) return 1;   // [0, 1,-1,0] 90°（实测锚点）
-            if (b == One && c == One) return 3;    // [0, 1, 1,0] 退化/转置
-            if (b == -One && c == One) return 2;   // [0,-1, 1,0] 270°
-            if (b == -One && c == -One) return 0;  // [0,-1,-1,0] 退化/反对角
+            if (b == One && c == -One) return new VideoOrientation(1, false);  // [0, 1,-1,0] 合法 90°（实测锚点）
+            if (b == One && c == One) return new VideoOrientation(1, true);    // [0, 1, 1,0] 退化阵：归零后水平镜像
+            if (b == -One && c == One) return new VideoOrientation(2, false);  // [0,-1, 1,0] 合法 270°
+            if (b == -One && c == -One) return new VideoOrientation(3, false); // [0,-1,-1,0] 退化/反对角（推导，无实测样本）
             return null;
         }
 

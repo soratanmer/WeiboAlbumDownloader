@@ -6,6 +6,21 @@ using System.IO;
 namespace WeiboAlbumDownloader.Helpers
 {
     /// <summary>
+    /// 旋转烘焙参数：FFmpeg transpose 方向 + 是否追加水平镜像。
+    /// 二者共同表达「先把 Rotation 归零，再（必要时）水平镜像」：
+    /// 源显示矩阵为纯旋转（det=+1）时只需转置；为反射阵（det=−1）时，其逆仍是反射，
+    /// 须在转置之后追加一次水平镜像才能还原正确的展示方向。
+    /// </summary>
+    /// <param name="Transpose">FFmpeg transpose 滤镜方向，取值 0..3</param>
+    /// <param name="HorizontalFlip">是否在转置后追加 hflip</param>
+    public readonly record struct VideoOrientation(int Transpose, bool HorizontalFlip)
+    {
+        /// <summary>拼出 FFmpeg <c>-vf</c> 滤镜串，如 <c>transpose=1</c> 或 <c>transpose=1,hflip</c>。</summary>
+        public string ToFilter()
+            => HorizontalFlip ? $"transpose={Transpose},hflip" : $"transpose={Transpose}";
+    }
+
+    /// <summary>
     /// FFmpeg 封装：定位并调用 ffmpeg(.exe)，将 iPhone 实况 MOV 重新封装为标准 MP4。
     /// 容器正确性（moov 前置、时序表、chunk 偏移、音频标准化）全部交由 FFmpeg 这个成熟复用器保证，
     /// 而非手工字节级手术。可选增强：未随程序分发 ffmpeg 时由调用方回退到纯 ftyp 换标。
@@ -58,30 +73,30 @@ namespace WeiboAlbumDownloader.Helpers
         /// </summary>
         /// <param name="srcPath">源视频路径（.mov / .mp4）</param>
         /// <param name="outPath">输出 MP4 路径（若存在将被覆盖）</param>
-        /// <param name="transposeDirection">非 null 时表示将旋转烘焙进像素：用 <c>-noautorotate</c> 关闭 ffmpeg 自动旋转，
-        /// 再以显式 <c>transpose=值</c> 重编码，使输出像素直接为展示方向、Rotation=0°（任何播放器均按像素显示，
-        /// 不受源文件中退化/非标准显示矩阵的解读差异影响）。值取 ffmpeg transpose 滤镜的 0..3；
-        /// null 表示无需烘焙，走常规 remux（0 是合法滤镜值，故不能用它表示「不烘焙」）。</param>
+        /// <param name="bake">非 null 时表示将旋转烘焙进像素：用 <c>-noautorotate</c> 关闭 ffmpeg 自动旋转，
+        /// 再以显式 <c>transpose</c>（必要时追加 <c>hflip</c>）重编码，使输出像素直接为展示方向、Rotation=0°
+        /// （任何播放器均按像素显示，不受源文件中退化/非标准显示矩阵的解读差异影响）。
+        /// null 表示无需烘焙，走常规 remux。</param>
         /// <returns>输出文件完整路径</returns>
         /// <exception cref="FileNotFoundException">未找到 ffmpeg(.exe)</exception>
         /// <exception cref="InvalidDataException">FFmpeg remux 失败</exception>
-        public static string RemuxToMp4(string srcPath, string outPath, int? transposeDirection = null)
+        public static string RemuxToMp4(string srcPath, string outPath, VideoOrientation? bake = null)
         {
             var exe = LocateFfmpeg()
                 ?? throw new FileNotFoundException("未找到 ffmpeg(.exe)（应随程序一起分发，或加入系统 PATH）。");
 
             // 旋转烘焙路径：竖拍照片的视频源可能带退化/非标准的显示矩阵（如 [0,1,1,0]，实为镜像而非旋转），不同播放器解读不一致，
-            // 导致部分端上播放被旋转 90°/270°。此处把源矩阵关掉（-noautorotate）并显式 transpose 重编码，
+            // 导致部分端上播放被旋转 90°/270° 或左右镜像。此处把源矩阵关掉（-noautorotate）并显式按矩阵的逆重编码，
             // 使输出像素直接为展示方向、Rotation=0°，彻底规避矩阵解读差异。烘焙失败则回退常规 remux（保持现状，不阻断合并）。
-            if (transposeDirection is int direction)
+            if (bake is VideoOrientation orientation)
             {
-                var bake = new[]
+                var bakeArgs = new[]
                 {
                     "-noautorotate", "-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-vf", $"transpose={direction}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-vf", orientation.ToFilter(),
                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outPath
                 };
-                if (RunAndSucceeded(exe, bake) && IsNonEmpty(outPath))
+                if (RunAndSucceeded(exe, bakeArgs) && IsNonEmpty(outPath))
                 {
                     return outPath;
                 }
