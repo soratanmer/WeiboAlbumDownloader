@@ -491,10 +491,10 @@ namespace WeiboAlbumDownloader.Helpers
         /// </summary>
         /// <param name="movPath">源 MOV 路径</param>
         /// <param name="outPath">输出 MP4 路径（通常为临时文件）</param>
-        /// <param name="transposeDirection">>0 时经 FFmpeg 把旋转烘焙进像素（竖屏 0°，见
-        /// <see cref="FfmpegInvoker.RemuxToMp4"/>）；0 表示常规 remux。</param>
+        /// <param name="transposeDirection">非 null 时经 FFmpeg 把旋转烘焙进像素（展示方向 0°，见
+        /// <see cref="FfmpegInvoker.RemuxToMp4"/>）；null 表示常规 remux。</param>
         /// <returns>输出文件完整路径</returns>
-        public static string RelabelMovToMp4(string movPath, string outPath, int transposeDirection = 0)
+        public static string RelabelMovToMp4(string movPath, string outPath, int? transposeDirection = null)
         {
             try
             {
@@ -763,22 +763,23 @@ namespace WeiboAlbumDownloader.Helpers
             try
             {
                 // ① MOV → 标准 MP4：FFmpeg remux（剔 mebx、faststart、音频 AAC）优选，缺失/失败回退纯 ftyp 换标。
-                //    竖拍照片的源视频可能带退化显示矩阵（不同播放器解读不一致，部分端播放旋转 90°/270°），
-                //    这里以封面方向为准：封面竖拍且视频像素为横屏时，把旋转烘焙进像素（输出竖屏 0°）。
-                //    要求严格横屏（vw>vh）：方形视频旋转后方向无意义，保持原样更安全。
-                //    transpose 方向常量需真机定乾坤（transpose=1 为当前选择，若成镜像改 2 即可一行切换）。
-                var transpose = 0;
+                //    竖拍照片的源视频可能带退化/非标准的显示矩阵（如 [0,1,1,0]，实为镜像而非旋转），
+                //    不同播放器解读不一致，部分端播放被旋转 90°/270°。
+                //    这里以封面方向为准（封面竖拍 + 视频严格横屏；方形视频旋转无意义，保持原样更安全），
+                //    方向则由源显示矩阵决定——矩阵才是根因，固定常量无法同时满足合法 90° 阵与退化阵。
+                int? transpose = null;
                 if (TryGetJpegPortrait(jpg, out var coverIsPortrait) && coverIsPortrait &&
-                    TryGetVideoPixelSize(mov, out var vw, out var vh) && vw > vh)
+                    TryGetVideoPixelSize(mov, out var vw, out var vh) && vw > vh &&
+                    TryGetVideoDisplayMatrix(mov, out var ma, out var mb, out var mc, out var md))
                 {
-                    transpose = MotionTransposeDirection;
+                    transpose = TransposeFromMatrix(ma, mb, mc, md);
                 }
 
                 tempRelabel = Path.Combine(tempDir, $"{Guid.NewGuid():N}.mp4");
                 RelabelMovToMp4(mov, tempRelabel, transpose);
 
                 // 烘焙路径：显式清零显示矩阵，保证输出 Rotation=0°（不依赖 FFmpeg 版本的矩阵传递行为）
-                if (transpose > 0)
+                if (transpose.HasValue)
                 {
                     ClearDisplayMatrix(tempRelabel);
                 }
@@ -882,9 +883,74 @@ namespace WeiboAlbumDownloader.Helpers
 
         // ─────────────────────────── 工具方法 ───────────────────────────
 
-        /// <summary>竖拍视频烘焙方向的 FFmpeg transpose 值。真机定镜像：transpose=1（顺时针90°）为当前选择；
-        /// 若产物同方向可见内容被镜像，改 2（逆时针90°）即可顺势切换。</summary>
-        private const int MotionTransposeDirection = 1;
+        /// <summary>
+        /// 读取视频轨 tkhd 的显示矩阵元素 [a,b,c,d]（16.16 定点）。
+        /// 以「宽字段非零」识别视频轨（音频/mebx 轨宽为 0），与 <see cref="ClearDisplayMatrix"/> 同一判据。
+        /// </summary>
+        /// <returns>解析到视频轨矩阵返回 true；文件异常或无视频轨返回 false</returns>
+        private static bool TryGetVideoDisplayMatrix(string videoPath, out int a, out int b, out int c, out int d)
+        {
+            a = b = c = d = 0;
+            try
+            {
+                var data = File.ReadAllBytes(videoPath);
+                var found = false;
+                var la = 0;
+                var lb = 0;
+                var lc = 0;
+                var ld = 0; // lambda 内不能直接写 out 参数，用局部变量中转
+                FindBoxes(data, 0, data.Length, "tkhd", (pos, size) =>
+                {
+                    if (found || size < 16) return;
+                    if (Be32(data, pos + size - 8) <= 0) return; // 音频/mebx 轨宽为 0
+
+                    // 矩阵位于 FullBox 头之后：v0 偏移 +48，v1（64 位时间戳）偏移 +60；
+                    // 9 元布局 [a,b,u,c,d,v,x,y,w]，故 a@+0 b@+4 c@+12 d@+16
+                    var version = data[pos + 8];
+                    var m = pos + (version == 1 ? 60 : 48);
+                    if (m + 36 > pos + size) return;
+
+                    la = Be32(data, m);
+                    lb = Be32(data, m + 4);
+                    lc = Be32(data, m + 12);
+                    ld = Be32(data, m + 16);
+                    found = true;
+                });
+
+                a = la;
+                b = lb;
+                c = lc;
+                d = ld;
+                return found;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 由源显示矩阵推出 FFmpeg transpose 方向。
+        /// MP4 显示矩阵（y 轴向下）与 FFmpeg transpose 滤镜（视觉旋转）之间相差一次竖直翻转，
+        /// 故按共轭 V∘M∘V 换算，即 [a,b,c,d] → [[a,−b],[−c,d]]：
+        /// <c>[0,1,−1,0]</c>(90°)→1、<c>[0,1,1,0]</c>(退化/转置)→3、<c>[0,−1,1,0]</c>(270°)→2、<c>[0,−1,−1,0]</c>(退化/反对角)→0。
+        /// 仅处理四分之一转矩阵（a=d=0 且 b,c 为 ±1.0）；单位阵/180° 等无法用 transpose 表达，返回 null 不烘焙。
+        /// </summary>
+        /// <returns>FFmpeg transpose 值 0..3；无需/无法烘焙时返回 null</returns>
+        private static int? TransposeFromMatrix(int a, int b, int c, int d)
+        {
+            const int One = 0x10000; // 16.16 定点中的 1.0
+            if (a != 0 || d != 0)
+            {
+                return null;
+            }
+
+            if (b == One && c == -One) return 1;   // [0, 1,-1,0] 90°（实测锚点）
+            if (b == One && c == One) return 3;    // [0, 1, 1,0] 退化/转置
+            if (b == -One && c == One) return 2;   // [0,-1, 1,0] 270°
+            if (b == -One && c == -One) return 0;  // [0,-1,-1,0] 退化/反对角
+            return null;
+        }
 
         /// <summary>
         /// 读取 JPEG 封面 SOF（Start Of Frame）实际像素方向，判断是否竖拍（高&gt;宽）。
