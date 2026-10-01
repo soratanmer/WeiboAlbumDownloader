@@ -302,7 +302,7 @@ namespace WeiboAlbumDownloader
 
                                                     AppendLog("已完成 " + Path.GetFileName(fileName), MessageEnum.Success);
 
-                                                    SetFileTime(fileName, timestamp);
+                                                    FileTimeHelper.SetFileTime(fileName, timestamp);
                                                 }
                                                 catch (Exception ex)
                                                 {
@@ -691,7 +691,7 @@ namespace WeiboAlbumDownloader
                                             await HttpHelper.GetAsync<AlbumDetailModel>(item, dataSource, cookie!, fileName);
 
                                             //修改文件日期时间为发博的时间
-                                            SetFileTime(fileName, timestamp);
+                                            FileTimeHelper.SetFileTime(fileName, timestamp);
 
                                             AppendLog("已完成 " + Path.GetFileName(fileName), MessageEnum.Success);
                                         }
@@ -975,7 +975,7 @@ namespace WeiboAlbumDownloader
                                                 await HttpHelper.GetAsync<AlbumDetailModel>(item.JpgUrl, dataSource, cookie!, fileNamee);
 
                                                 //修改文件日期时间为发博的时间
-                                                SetFileTime(fileNamee, timestamp);
+                                                FileTimeHelper.SetFileTime(fileNamee, timestamp);
 
                                                 AppendLog("已完成 " + Path.GetFileName(fileNamee), MessageEnum.Success);
                                             }
@@ -998,7 +998,7 @@ namespace WeiboAlbumDownloader
                                                     try
                                                     {
                                                         await HttpHelper.GetAsync<AlbumDetailModel>(item.MovUrl, dataSource, cookie!, movFile);
-                                                        SetFileTime(movFile, timestamp);
+                                                        FileTimeHelper.SetFileTime(movFile, timestamp);
                                                         AppendLog("已完成 " + Path.GetFileName(movFile), MessageEnum.Success);
 
                                                         try
@@ -1054,7 +1054,7 @@ namespace WeiboAlbumDownloader
                                                     await HttpHelper.GetAsync<AlbumDetailModel>(item, dataSource, cookie!, fileNamee);
 
                                                     //修改文件日期时间为发博的时间
-                                                    SetFileTime(fileNamee, timestamp);
+                                                    FileTimeHelper.SetFileTime(fileNamee, timestamp);
 
                                                     AppendLog("已完成 " + Path.GetFileName(fileNamee), MessageEnum.Success);
                                                 }
@@ -1098,7 +1098,7 @@ namespace WeiboAlbumDownloader
                                                     await HttpHelper.GetAsync<AlbumDetailModel>(item, dataSource, cookie!, fileNamee);
 
                                                     //修改文件日期时间为发博的时间
-                                                    SetFileTime(fileNamee, timestamp);
+                                                    FileTimeHelper.SetFileTime(fileNamee, timestamp);
 
                                                     AppendLog("已完成 " + Path.GetFileName(fileNamee), MessageEnum.Success);
 
@@ -1264,13 +1264,6 @@ namespace WeiboAlbumDownloader
             {
                 AppendLog($"已开启Crontab定时任务，{CronExpressionDescriptor.ExpressionDescriptor.GetDescription(settings.Crontab)}", MessageEnum.Info);
             }
-        }
-
-        private void SetFileTime(string filename, DateTime timestamp)
-        {
-            File.SetCreationTime(filename, timestamp);
-            File.SetLastWriteTime(filename, timestamp);
-            File.SetLastAccessTime(filename, timestamp);
         }
 
         #region UI操作

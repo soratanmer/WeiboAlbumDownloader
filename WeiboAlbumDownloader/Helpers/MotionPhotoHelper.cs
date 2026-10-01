@@ -804,8 +804,13 @@ namespace WeiboAlbumDownloader.Helpers
                     throw new InvalidDataException($"合成校验失败：输出 {totalLength} 字节未完整包含内嵌视频。");
                 }
 
-                // ⑤ 原子覆盖原 jpg（用临时文件 Move），再删除 mov
+                // ⑤ 原子覆盖原 jpg（用临时文件 Move），再删除 mov。
+                //    tempMerged 是刚创建的文件，时间戳即"此刻"；File.Move 会把它带到目标路径，
+                //    冲掉下载阶段写入的发帖日期（批量合并路径手中没有发帖时间，唯一来源就是封面自身的时间戳）。
+                //    故覆盖前先记下，覆盖后原样回填。
+                var postTime = File.GetLastWriteTime(jpg);
                 File.Move(tempMerged, jpg, overwrite: true);
+                TrySetFileTime(jpg, postTime);
                 File.Delete(mov);
                 return true;
             }
@@ -1229,6 +1234,22 @@ namespace WeiboAlbumDownloader.Helpers
             catch
             {
                 // 忽略清理失败
+            }
+        }
+
+        /// <summary>
+        /// 回填文件时间戳，异常静默：产物此时已正确落盘，
+        /// 不应因元数据写入失败把一次成功的合并报成失败。
+        /// </summary>
+        private static void TrySetFileTime(string path, DateTime timestamp)
+        {
+            try
+            {
+                FileTimeHelper.SetFileTime(path, timestamp);
+            }
+            catch
+            {
+                // 忽略时间戳写入失败
             }
         }
 
