@@ -579,6 +579,11 @@ namespace WeiboAlbumDownloader.Helpers
         /// <summary>
         /// 探测 jpg 是否已是动态照片（头部 XMP 含 MicroVideoOffset / Item:Length）
         /// </summary>
+        /// <remarks>
+        /// Google 容器形式不可按「全文首次出现」取 Item:Length：Container:Directory 里 Primary 项
+        /// 同样带该属性且值为 0，会先被命中而把已合成的动态照片误判为普通照片。
+        /// 须先以 Item:Semantic="MotionPhoto" 定位目标标签，再在该标签内取值。
+        /// </remarks>
         /// <param name="jpgPath">JPEG 路径</param>
         /// <returns>内嵌视频字节长度；非动态照片返回 null</returns>
         public static long? TryDetectMotionPhoto(string jpgPath)
@@ -609,7 +614,9 @@ namespace WeiboAlbumDownloader.Helpers
 
                 var text = Encoding.Latin1.GetString(buffer);
 
-                // 模式：MicroVideoOffset="12345" / MicroVideoOffset>12345< 或 Item:Length= 系列
+                // 模式：MicroVideoOffset="12345" / <GCamera:MicroVideoOffset>12345< / Google 容器项。
+                // legacy 两条排在最前：本程序产物已剔除 legacy 字段，必然落到容器项那条；
+                // 带 legacy 字段的第三方/旧版产物则与改动前行为完全一致。
                 var offset = ParseMarker(text, "MicroVideoOffset=\"");
                 if (offset is null)
                 {
@@ -617,7 +624,7 @@ namespace WeiboAlbumDownloader.Helpers
                 }
                 if (offset is null)
                 {
-                    offset = ParseMarker(text, "Item:Length=\"");
+                    offset = ParseContainerItemLength(text, "MotionPhoto");
                 }
                 if (offset is null)
                 {
@@ -635,6 +642,33 @@ namespace WeiboAlbumDownloader.Helpers
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// 解析 Container:Directory 中指定语义项（如 MotionPhoto）的 Item:Length。
+        /// 取值范围限定在「该属性所属标签」之内：Primary 项同样带 Item:Length="0" 且位置更靠前，
+        /// 按全文首次出现取值会命中它；限定标签后同时对标签内的属性顺序不敏感。
+        /// </summary>
+        /// <param name="text">XMP 文本</param>
+        /// <param name="semantic">Container:Item 的 Item:Semantic 取值（如 MotionPhoto）</param>
+        /// <returns>该项的 Item:Length；未找到返回 null</returns>
+        private static long? ParseContainerItemLength(string text, string semantic)
+        {
+            var idx = text.IndexOf($"Item:Semantic=\"{semantic}\"", StringComparison.Ordinal);
+            if (idx < 0)
+            {
+                return null;
+            }
+
+            // XML 标签不嵌套，最近的前一个 '<' 即当前标签的起始，最近的后一个 '>' 即其结束
+            var open = text.LastIndexOf('<', idx);
+            var close = text.IndexOf('>', idx);
+            if (open < 0 || close < open)
+            {
+                return null;
+            }
+
+            return ParseMarker(text.Substring(open, close - open + 1), "Item:Length=\"");
         }
 
         /// <summary>从文本中解析 marker 之后的数字（直到引号或尖括号）</summary>
