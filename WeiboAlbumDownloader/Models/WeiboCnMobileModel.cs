@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using WeiboAlbumDownloader.Converters;
 
 namespace WeiboAlbumDownloader.Models
 {
@@ -198,7 +199,9 @@ namespace WeiboAlbumDownloader.Models
         [JsonProperty("page_info")]
         public PageInfo? PageInfo { get; set; }
 
+        //微博偶发把 pics 序列化成以数字字符串为键的对象（{"0":..}），用转换器兼容数组与对象两种形状
         [JsonProperty("pics")]
+        [JsonConverter(typeof(JsonArrayOrObjectConverter<Pic>))]
         public List<Pic>? Pics { get; set; }
 
         [JsonProperty("live_photo")]
