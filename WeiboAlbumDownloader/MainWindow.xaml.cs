@@ -909,37 +909,22 @@ namespace WeiboAlbumDownloader
 
                                         int id = 1;
                                         //构造统一媒体队列：优先用 pics 的逐图权威结构（图按发布顺序），
-                                        //实况 mov 从 Mblog.LivePhoto 按实况出现顺序取值，保证封面与 mov 成对命名(_k.jpg/_k.mov)
-                                        var mediaItems = new List<(string JpgUrl, string? MovUrl)>();
+                                        //实况 mov 与封面成对命名(_k.jpg/_k.mov)，封面↔mov 的配对交给 LivePhotoPairer
+                                        var mediaItems = new List<LivePhotoPairer.MediaItem>();
                                         bool usedPicsMedia = false;
                                         if (card?.Mblog?.Pics is { Count: > 0 } picsList)
                                         {
                                             usedPicsMedia = true;
-                                            int liveIndex = 0;
-                                            foreach (var pic in picsList)
+                                            mediaItems.AddRange(LivePhotoPairer.Build(picsList, originalLivePhotos, out var unpairedLivePids));
+                                            foreach (var unpairedPid in unpairedLivePids)
                                             {
-                                                if (string.IsNullOrEmpty(pic?.Pid)) continue;
-                                                bool isLive = !string.IsNullOrEmpty(pic.VideoSrc)
-                                                    || string.Equals(pic.Type, "livephoto", StringComparison.OrdinalIgnoreCase);
-                                                string? movUrl = null;
-                                                if (isLive)
-                                                {
-                                                    if (liveIndex < originalLivePhotos.Count)
-                                                    {
-                                                        movUrl = originalLivePhotos[liveIndex++];
-                                                    }
-                                                    else
-                                                    {
-                                                        AppendLog("实况 mov 超出 LivePhoto 可用数量，跳过该实况视频：" + pic.Pid, MessageEnum.Warning);
-                                                    }
-                                                }
-                                                mediaItems.Add(("https://wx4.sinaimg.cn/large/" + pic.Pid + ".jpg", movUrl));
+                                                AppendLog("实况视频源缺失，该图仅保留静态封面：" + unpairedPid, MessageEnum.Warning);
                                             }
                                         }
                                         else
                                         {
                                             //回退：无 pics 数组（罕见），仅按 PicIds 下图，实况由原 LivePhoto 列表靠 CID 兜底
-                                            foreach (var pid in originalPics) mediaItems.Add((pid, null));
+                                            foreach (var pid in originalPics) mediaItems.Add(new LivePhotoPairer.MediaItem(pid, null));
                                         }
 
                                         //逐张下载封面图；实况图连带下载同名 _k.mov 并自动合并
