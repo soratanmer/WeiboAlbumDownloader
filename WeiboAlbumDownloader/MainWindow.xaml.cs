@@ -916,9 +916,13 @@ namespace WeiboAlbumDownloader
                                         {
                                             usedPicsMedia = true;
                                             mediaItems.AddRange(LivePhotoPairer.Build(picsList, originalLivePhotos, out var unpairedLivePids));
-                                            foreach (var unpairedPid in unpairedLivePids)
+                                            //关闭"下载Live Photo"时不下载 mov，此时的"源缺失"属预期而非异常，不输出警告
+                                            if (settings!.EnableDownloadLivePhoto)
                                             {
-                                                AppendLog("实况视频源缺失，该图仅保留静态封面：" + unpairedPid, MessageEnum.Warning);
+                                                foreach (var unpairedPid in unpairedLivePids)
+                                                {
+                                                    AppendLog("实况视频源缺失，该图仅保留静态封面：" + unpairedPid, MessageEnum.Warning);
+                                                }
                                             }
                                         }
                                         else
@@ -969,8 +973,9 @@ namespace WeiboAlbumDownloader
                                                 AppendLog($"文件下载失败，原始url：{item.JpgUrl}，下载路径{fileNamee}", MessageEnum.Error);
                                             }
 
-                                            //实况图：成对下载同名 _k.mov 并自动合并（配对优先 CID，失败以文件名兜底）
-                                            if (!string.IsNullOrEmpty(item.MovUrl))
+                                            //实况图：成对下载同名 _k.mov 并自动合并（受"下载Live Photo"开关控制）
+                                            //配对由本循环已确定的封面路径(fileNamee)显式给定，不再靠 CID/文件名推导
+                                            if (settings!.EnableDownloadLivePhoto && !string.IsNullOrEmpty(item.MovUrl))
                                             {
                                                 var movFile = fileName + $"_{id}.mov";
                                                 if (File.Exists(movFile))
@@ -988,7 +993,7 @@ namespace WeiboAlbumDownloader
 
                                                         try
                                                         {
-                                                            if (MotionPhotoHelper.MergeByMov(movFile, out var mergeSkip))
+                                                            if (MotionPhotoHelper.MergeByMov(movFile, fileNamee, out var mergeSkip))
                                                                 AppendLog("已自动合并为动态照片：" + Path.GetFileName(movFile), MessageEnum.Success);
                                                             else
                                                                 AppendLog("实况照片未合并（" + mergeSkip + "）：" + Path.GetFileName(movFile), MessageEnum.Warning);

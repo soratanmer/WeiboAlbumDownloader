@@ -74,7 +74,9 @@ namespace WeiboAlbumDownloader.Helpers
     ///    因为 OPPO 等严格解析器会因 legacy 字段拒识）。<br/>
     ///    GCamera:MicroVideoOffset 与 Container:Directory/Item:Length 均取「尾部内嵌微视频的字节长度」，
     ///    解析器按 视频起点 = 文件总长 − offset 反推（已验证可播放的 QQ / OPPO 参考文件如此取值）；<br/>
-    /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底。<br/>
+    /// 3. 配对主依据为 ContentIdentifier UUID（jpg EXIF 端 与 mov QuickTime 端各存一份），文件名分组仅作兜底；
+    ///    该推导策略只服务于「批量合并」与「无 pics 回退」这两条没有下载期配对信息的路径，下载主链路（pics）
+    ///    由调用方显式给定封面路径，不参与推导。<br/>
     /// 内嵌 MP4 首选经过 FFmpeg remux（剔除 iPhone 专有的 mebx 音轨，moov faststart 前置，音频重编码为 AAC），
     /// 以满足 OPPO 等严格解析器对「标准干净 MP4 容器」的校验；未随程序分发 ffmpeg 或 remux 失败时，
     /// 回退为仅修正 ftyp 品牌（qt→isom，兼容品牌 qt→mp42）的换标产物（宽松端仍可识别，OPPO 可能不识别）。
@@ -859,20 +861,17 @@ namespace WeiboAlbumDownloader.Helpers
         }
 
         /// <summary>
-        /// 下载完成后自动合并单个实况照片：读取 mov 的 ContentIdentifier，
+        /// 自动合并单个实况照片（启发式定位封面）：读取 mov 的 ContentIdentifier，
         /// 在同级目录定位配对封面 jpg，再复用 MergeOne 覆盖封面并删除 mov。
+        /// 仅用于没有下载期配对信息的路径（无 pics 回退、批量合并）。
         /// </summary>
-        /// <param name="movPath">刚下载的实况视频路径(.mov)</param>
+        /// <param name="movPath">实况视频路径(.mov)</param>
         /// <param name="skipReason">返回跳过原因（未跳过时为 null）</param>
         /// <returns>是否完成合并（true）或跳过（false）。定位或合并失败以异常抛出</returns>
         public static bool MergeByMov(string movPath, out string? skipReason)
         {
             skipReason = null;
-
-            if (string.IsNullOrWhiteSpace(movPath) || !File.Exists(movPath))
-            {
-                throw new FileNotFoundException("实况视频不存在。", movPath);
-            }
+            EnsureMovExists(movPath);
 
             var dir = Path.GetDirectoryName(movPath) ?? throw new InvalidDataException("无法解析实况视频目录。");
 
@@ -909,11 +908,53 @@ namespace WeiboAlbumDownloader.Helpers
             }
 
             // ③ 复用 MergeOne：内部含幂等、成功后覆盖+删除
+            return MergeWithCover(movPath, matchedJpg, out skipReason);
+        }
+
+        /// <summary>
+        /// 下载链路的显式配对合并：封面由调用方给定（下载时封面与 mov 同 id 成对落盘），
+        /// 不做任何 ContentIdentifier / 文件名推导——配对在下载期已经确定，此处不再重新猜。
+        /// </summary>
+        /// <param name="movPath">刚下载的实况视频路径(.mov)</param>
+        /// <param name="coverJpgPath">与本次下载成对的封面 jpg 路径</param>
+        /// <param name="skipReason">返回跳过原因（未跳过时为 null）</param>
+        /// <returns>是否完成合并（true）或跳过（false）。mov 缺失或合并失败以异常抛出</returns>
+        public static bool MergeByMov(string movPath, string coverJpgPath, out string? skipReason)
+        {
+            skipReason = null;
+            EnsureMovExists(movPath);
+
+            // 封面下载失败时按"跳过"处理而非抛错：与启发式路径的"未找到配对封面 jpg"同级，
+            // 保留 mov 供稍后补下封面，不把一次下载失败升级成合并异常。
+            if (string.IsNullOrWhiteSpace(coverJpgPath) || !File.Exists(coverJpgPath))
+            {
+                skipReason = "封面文件缺失（下载失败），保留实况视频";
+                return false;
+            }
+
+            return MergeWithCover(movPath, coverJpgPath, out skipReason);
+        }
+
+        /// <summary>校验实况视频存在，缺失时抛出与既有链路一致的异常。</summary>
+        private static void EnsureMovExists(string movPath)
+        {
+            if (string.IsNullOrWhiteSpace(movPath) || !File.Exists(movPath))
+            {
+                throw new FileNotFoundException("实况视频不存在。", movPath);
+            }
+        }
+
+        /// <summary>
+        /// 建临时目录 → 交给 MergeOne（内部含幂等、成功后覆盖封面并删除 mov）→ 清理临时目录。
+        /// 两条公开入口（显式配对 / 启发式定位）共用的收尾。
+        /// </summary>
+        private static bool MergeWithCover(string movPath, string coverJpgPath, out string? skipReason)
+        {
             var tempDir = Path.Combine(Path.GetTempPath(), "WeiboAlbumDownloader", $"motion-by-mov-{Guid.NewGuid():N}");
             Directory.CreateDirectory(tempDir);
             try
             {
-                return MergeOne(new LivePhotoPair { JpgPath = matchedJpg, MovPath = movPath, GroupKey = string.Empty }, tempDir, out skipReason);
+                return MergeOne(new LivePhotoPair { JpgPath = coverJpgPath, MovPath = movPath, GroupKey = string.Empty }, tempDir, out skipReason);
             }
             finally
             {
